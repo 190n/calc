@@ -11,7 +11,8 @@ const Op = union(enum) {
 const Program = struct {
     code: std.BoundedArray(Op, 256) = .{},
     peak_stack_size: u16 = 0,
-    args_required: u16 = 0,
+    num_args: u16 = 0,
+    num_returns: u16 = 0,
 
     const ParseError = std.fmt.ParseFloatError || error{ InvalidOperator, TooLong };
 
@@ -38,7 +39,7 @@ const Program = struct {
                     while (current_stack_size < 2) {
                         current_stack_size += 1;
                         p.peak_stack_size += 1;
-                        p.args_required += 1;
+                        p.num_args += 1;
                     }
 
                     current_stack_size -= 1;
@@ -46,7 +47,79 @@ const Program = struct {
             }
         }
 
+        p.num_returns = current_stack_size;
         return p;
+    }
+
+    fn writeOffset(asm_buf: *AsmBuf, register: u8, offset: u16) !void {
+        const byte_offset = @sizeOf(f64) * offset;
+
+        if (byte_offset <= 0x7f) {
+            try asm_buf.addImmediate(&.{0x40 | register});
+            try asm_buf.addImmediate(&.{@truncate(byte_offset)});
+        } else {
+            try asm_buf.addImmediate(&.{0x80 | register});
+            try asm_buf.addImmediate(std.mem.asBytes(&std.mem.nativeToLittle(u32, byte_offset)));
+        }
+    }
+
+    pub fn compile(
+        self: *const Program,
+        asm_buf: *align(std.mem.page_size) AsmBuf,
+    ) ![256]f64 {
+        comptime std.debug.assert(@import("builtin").cpu.arch == .x86_64);
+
+        var constants = [_]f64{0.0} ** 256;
+        var num_constants: usize = 0;
+
+        for (self.code.slice()) |inst| {
+            switch (inst) {
+                .constant => |c| {
+                    if (std.mem.indexOfScalar(f64, constants[0..num_constants], c) == null) {
+                        constants[num_constants] = c;
+                        num_constants += 1;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        var top: u16 = self.num_args;
+
+        for (self.code.slice()) |inst| {
+            switch (inst) {
+                .add => {
+                    // movsd (8*(top-2))(%rdi), %xmm0
+                    try asm_buf.addInstruction(3, 0xf20f10);
+                    try writeOffset(asm_buf, 0x7, top - 2);
+                    // addsd (8*(top-1))(%rdi), %xmm0
+                    try asm_buf.addInstruction(3, 0xf20f58);
+                    try writeOffset(asm_buf, 0x7, top - 1);
+                    // movsd %xmm0, (8*(top-2))(%rdi)
+                    try asm_buf.addInstruction(3, 0xf20f11);
+                    try writeOffset(asm_buf, 0x7, top - 2);
+                    top -= 1;
+                },
+                .sub => unreachable,
+                .mul => unreachable,
+                .div => unreachable,
+
+                .constant => |c| {
+                    const index = std.mem.indexOfScalar(f64, &constants, c).?;
+                    // movsd (8*index)(%rsi), %xmm0
+                    try asm_buf.addInstruction(3, 0xf20f10);
+                    try writeOffset(asm_buf, 0x6, @intCast(index));
+                    // movsd %xmm0, (8*top)(%rdi)
+                    try asm_buf.addInstruction(3, 0xf20f11);
+                    try writeOffset(asm_buf, 0x7, top);
+                    top += 1;
+                },
+            }
+        }
+
+        // ret
+        try asm_buf.addInstruction(1, 0xc3);
+        return constants;
     }
 };
 
@@ -68,14 +141,22 @@ const AsmBuf = extern struct {
         return buf;
     }
 
-    pub fn addInstruction(self: *AsmBuf, size: usize, inst: u64) void {
+    pub fn addInstruction(self: *AsmBuf, size: usize, inst: u64) error{Overflow}!void {
+        if (self.len + size > self.code.len) {
+            return error.Overflow;
+        }
+
         const all_bytes: [8]u8 = @bitCast(std.mem.nativeToBig(u64, inst));
         const bytes_to_copy = all_bytes[8 - size .. 8];
         @memcpy(self.code[self.len..][0..size], bytes_to_copy);
         self.len += size;
     }
 
-    pub fn addImmediate(self: *AsmBuf, value: []const u8) void {
+    pub fn addImmediate(self: *AsmBuf, value: []const u8) error{Overflow}!void {
+        if (self.len + value.len > self.code.len) {
+            return error.Overflow;
+        }
+
         @memcpy(self.code[self.len..][0..value.len], value);
         self.len += value.len;
     }
@@ -96,29 +177,36 @@ pub fn main() !void {
     var buf = try AsmBuf.create();
     defer buf.destroy();
 
-    buf.addInstruction(2, 0x48b8);
-    buf.addImmediate(std.mem.asBytes(&std.mem.nativeToLittle(u64, @bitCast(@as(f64, 1.0)))));
-    buf.addInstruction(5, 0x66480f6ec8);
-    buf.addInstruction(4, 0xf20f58c1);
-    buf.addInstruction(1, 0xc3);
-
-    try buf.finalize();
-
-    const func: *const fn (f64) callconv(.C) f64 = @ptrCast(&buf.code);
-    std.debug.print("{}\n", .{func(6.9)});
+    var stack: [257]f64 = undefined;
 
     if (argv.len != 2) {
         return error.WrongNumberOfArguments;
     }
 
     const program = try Program.parse(argv[1]);
-
-    std.debug.print("{} {}\n", .{ program.peak_stack_size, program.args_required });
+    const constants = try program.compile(buf);
+    try buf.finalize();
+    const func: *const fn ([*]f64, [*]const f64) callconv(.C) void = @ptrCast(&buf.code);
 
     var input = std.io.getStdIn().reader();
     var line_buf: [1024]u8 = undefined;
     while (try input.readUntilDelimiterOrEof(&line_buf, '\n')) |line| {
         var it = std.mem.tokenizeScalar(u8, line, ' ');
-        _ = it;
+        var index: usize = 0;
+        while (it.next()) |substring| {
+            const arg = try std.fmt.parseFloat(f64, substring);
+            stack[index] = arg;
+            index += 1;
+        }
+
+        if (index != program.num_args) {
+            return error.Bleh;
+        }
+
+        func(&stack, &constants);
+        for (stack[0..program.num_returns]) |f| {
+            std.debug.print("{d} ", .{f});
+        }
+        std.debug.print("\n", .{});
     }
 }
