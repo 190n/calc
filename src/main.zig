@@ -100,9 +100,42 @@ const Program = struct {
                     try writeOffset(asm_buf, 0x7, top - 2);
                     top -= 1;
                 },
-                .sub => unreachable,
-                .mul => unreachable,
-                .div => unreachable,
+                .sub => {
+                    // movsd (8*(top-2))(%rdi), %xmm0
+                    try asm_buf.addInstruction(3, 0xf20f10);
+                    try writeOffset(asm_buf, 0x7, top - 2);
+                    // subsd (8*(top-1))(%rdi), %xmm0
+                    try asm_buf.addInstruction(3, 0xf20f5c);
+                    try writeOffset(asm_buf, 0x7, top - 1);
+                    // movsd %xmm0, (8*(top-2))(%rdi)
+                    try asm_buf.addInstruction(3, 0xf20f11);
+                    try writeOffset(asm_buf, 0x7, top - 2);
+                    top -= 1;
+                },
+                .mul => {
+                    // movsd (8*(top-2))(%rdi), %xmm0
+                    try asm_buf.addInstruction(3, 0xf20f10);
+                    try writeOffset(asm_buf, 0x7, top - 2);
+                    // mulsd (8*(top-1))(%rdi), %xmm0
+                    try asm_buf.addInstruction(3, 0xf20f59);
+                    try writeOffset(asm_buf, 0x7, top - 1);
+                    // movsd %xmm0, (8*(top-2))(%rdi)
+                    try asm_buf.addInstruction(3, 0xf20f11);
+                    try writeOffset(asm_buf, 0x7, top - 2);
+                    top -= 1;
+                },
+                .div => {
+                    // movsd (8*(top-2))(%rdi), %xmm0
+                    try asm_buf.addInstruction(3, 0xf20f10);
+                    try writeOffset(asm_buf, 0x7, top - 2);
+                    // divsd (8*(top-1))(%rdi), %xmm0
+                    try asm_buf.addInstruction(3, 0xf20f5e);
+                    try writeOffset(asm_buf, 0x7, top - 1);
+                    // movsd %xmm0, (8*(top-2))(%rdi)
+                    try asm_buf.addInstruction(3, 0xf20f11);
+                    try writeOffset(asm_buf, 0x7, top - 2);
+                    top -= 1;
+                },
 
                 .constant => |c| {
                     const index = std.mem.indexOfScalar(f64, &constants, c).?;
