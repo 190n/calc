@@ -17,35 +17,43 @@ peak_stack_size: u16 = 0,
 num_args: u16 = 0,
 num_returns: u16 = 0,
 
-pub const ParseError = std.fmt.ParseFloatError || error{ InvalidOperator, TooLong };
+pub const ParseError = std.fmt.ParseFloatError || error{ InvalidProgram, TooLong };
 
-pub fn parse(text: []const u8) ParseError!Program {
+pub fn parse(texts: [][]const u8, erroneous_part: ?*[]const u8) ParseError!Program {
     var p = Program{};
     var current_stack_size: u16 = 0;
 
-    var it = std.mem.tokenizeScalar(u8, text, ' ');
-    while (it.next()) |s| {
-        if (std.fmt.parseFloat(f64, s)) |f| {
-            p.code.append(.{ .constant = f }) catch return error.TooLong;
-            current_stack_size += 1;
-            p.peak_stack_size = @max(current_stack_size, p.peak_stack_size);
-        } else |_| {
-            if (s.len == 1) {
-                p.code.append(switch (s[0]) {
-                    '+' => .add,
-                    '-' => .sub,
-                    '*' => .mul,
-                    '/' => .div,
-                    else => return error.InvalidOperator,
-                }) catch return error.TooLong;
+    for (texts) |text| {
+        var it = std.mem.tokenizeScalar(u8, text, ' ');
+        while (it.next()) |s| {
+            if (std.fmt.parseFloat(f64, s)) |f| {
+                p.code.append(.{ .constant = f }) catch return error.TooLong;
+                current_stack_size += 1;
+                p.peak_stack_size = @max(current_stack_size, p.peak_stack_size);
+            } else |_| {
+                if (s.len == 1) {
+                    p.code.append(switch (s[0]) {
+                        '+' => .add,
+                        '-' => .sub,
+                        '*' => .mul,
+                        '/' => .div,
+                        else => {
+                            if (erroneous_part) |e| e.* = s;
+                            return error.InvalidProgram;
+                        },
+                    }) catch return error.TooLong;
 
-                while (current_stack_size < 2) {
-                    current_stack_size += 1;
-                    p.peak_stack_size += 1;
-                    p.num_args += 1;
+                    while (current_stack_size < 2) {
+                        current_stack_size += 1;
+                        p.peak_stack_size += 1;
+                        p.num_args += 1;
+                    }
+
+                    current_stack_size -= 1;
+                } else {
+                    if (erroneous_part) |e| e.* = s;
+                    return error.InvalidProgram;
                 }
-
-                current_stack_size -= 1;
             }
         }
     }

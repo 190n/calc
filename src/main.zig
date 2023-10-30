@@ -5,7 +5,7 @@ const AsmBuf = @import("./asmbuf.zig").AsmBuf;
 
 const CompiledCode = *const fn (stack: [*]f64, constants: [*]const f64) callconv(.C) void;
 
-const Diagnostic = union(enum) {
+const ExecDiagnostic = union {
     none: void,
     actual_num_args: usize,
     invalid_numeric_literal: []const u8,
@@ -17,7 +17,7 @@ fn execLine(
     line: []const u8,
     stdout: std.fs.File.Writer,
     constants: []const f64,
-    diagnostic: ?*Diagnostic,
+    diagnostic: ?*ExecDiagnostic,
 ) !void {
     var it = std.mem.tokenizeScalar(u8, line, ' ');
     var index: usize = 0;
@@ -43,21 +43,26 @@ fn execLine(
     } else {
         try stdout.print("{d}", .{stack[0]});
         for (stack[1..program.num_returns]) |f| {
-            try stdout.print("{d} ", .{f});
+            try stdout.print(" {d}", .{f});
         }
         try stdout.print("\n", .{});
     }
 }
 
-fn run(argv: [][:0]u8, stdout: std.fs.File.Writer, stderr: std.fs.File.Writer) !void {
+fn run(
+    argv: [][:0]u8,
+    stdout: std.fs.File.Writer,
+    stderr: std.fs.File.Writer,
+    erroneous_part: ?*[]const u8,
+) !void {
     var buf = try AsmBuf.create();
     defer buf.destroy();
 
-    if (argv.len != 2) {
+    if (argv.len < 2) {
         return error.WrongNumberOfArguments;
     }
 
-    const program = try Program.parse(argv[1]);
+    const program = try Program.parse(argv[1..], erroneous_part);
     const constants = try program.compile(buf);
     const func = try buf.finalize(CompiledCode);
 
@@ -67,7 +72,7 @@ fn run(argv: [][:0]u8, stdout: std.fs.File.Writer, stderr: std.fs.File.Writer) !
     try stderr.writeAll("> ");
 
     while (try input.readUntilDelimiterOrEof(&line_buf, '\n')) |line| {
-        var diagnostic = Diagnostic{ .none = {} };
+        var diagnostic = ExecDiagnostic{ .none = {} };
 
         execLine(func, program, line, stdout, &constants, &diagnostic) catch |e| {
             std.log.err("{s}", .{@errorName(e)});
@@ -93,6 +98,7 @@ const usage =
     \\    program is a RPN expression which starts with some arguments (user input) already on the
     \\    stack. supported: decimal constants, +, -, *, /. if program is '+ 2 *', then after running
     \\    the user enters two numbers, and twice their sum will be printed.
+    \\
 ;
 
 pub fn main() !void {
@@ -105,7 +111,24 @@ pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
     const stderr = std.io.getStdErr().writer();
 
-    run(argv, stdout, stderr) catch |e| switch (e) {
-        else => return e,
+    for (argv[1..]) |s| {
+        if (std.mem.eql(u8, s, "-h")) {
+            try stderr.print(usage, .{argv[0]});
+            return;
+        }
+    }
+
+    var erroneous_part: []const u8 = &.{};
+
+    run(argv, stdout, stderr, &erroneous_part) catch |e| {
+        std.log.err("{s}", .{@errorName(e)});
+        switch (e) {
+            error.InvalidProgram => std.log.info("\"{s}\" is not a valid number or operator", .{erroneous_part}),
+            error.TooLong => std.log.info("program has too many instructions", .{}),
+            error.WrongNumberOfArguments => try stderr.print(usage, .{argv[0]}),
+            else => {},
+        }
+        std.log.info("use \"{s} -h\" for usage", .{argv[0]});
+        std.process.exit(1);
     };
 }
