@@ -1,216 +1,57 @@
 const std = @import("std");
 
-const Op = union(enum) {
-    add: void,
-    sub: void,
-    mul: void,
-    div: void,
-    constant: f64,
+const Program = @import("./program.zig");
+const AsmBuf = @import("./asmbuf.zig").AsmBuf;
+
+const CompiledCode = *const fn (stack: [*]f64, constants: [*]const f64) callconv(.C) void;
+
+const Diagnostic = union(enum) {
+    none: void,
+    actual_num_args: usize,
+    invalid_numeric_literal: []const u8,
 };
 
-const Program = struct {
-    code: std.BoundedArray(Op, 256) = .{},
-    peak_stack_size: u16 = 0,
-    num_args: u16 = 0,
-    num_returns: u16 = 0,
+fn execLine(
+    code: CompiledCode,
+    program: Program,
+    line: []const u8,
+    stdout: std.fs.File.Writer,
+    constants: []const f64,
+    diagnostic: ?*Diagnostic,
+) !void {
+    var it = std.mem.tokenizeScalar(u8, line, ' ');
+    var index: usize = 0;
+    var stack: [257]f64 = undefined;
+    while (it.next()) |substring| {
+        const arg = std.fmt.parseFloat(f64, substring) catch |e| {
+            if (diagnostic) |d| d.* = .{ .invalid_numeric_literal = substring };
+            return e;
+        };
+        stack[index] = arg;
+        index += 1;
+    }
 
-    const ParseError = std.fmt.ParseFloatError || error{ InvalidOperator, TooLong };
+    if (index != program.num_args) {
+        if (diagnostic) |d| d.* = .{ .actual_num_args = index };
+        return error.WrongNumberOfArguments;
+    }
 
-    pub fn parse(text: []const u8) ParseError!Program {
-        var p = Program{};
-        var current_stack_size: u16 = 0;
+    code(&stack, constants.ptr);
 
-        var it = std.mem.tokenizeScalar(u8, text, ' ');
-        while (it.next()) |s| {
-            if (std.fmt.parseFloat(f64, s)) |f| {
-                p.code.append(.{ .constant = f }) catch return error.TooLong;
-                current_stack_size += 1;
-                p.peak_stack_size = @max(current_stack_size, p.peak_stack_size);
-            } else |_| {
-                if (s.len == 1) {
-                    p.code.append(switch (s[0]) {
-                        '+' => .add,
-                        '-' => .sub,
-                        '*' => .mul,
-                        '/' => .div,
-                        else => return error.InvalidOperator,
-                    }) catch return error.TooLong;
-
-                    while (current_stack_size < 2) {
-                        current_stack_size += 1;
-                        p.peak_stack_size += 1;
-                        p.num_args += 1;
-                    }
-
-                    current_stack_size -= 1;
-                }
-            }
+    if (program.num_returns == 0) {
+        try stdout.writeAll("(empty stack)\n");
+    } else {
+        try stdout.print("{d}", .{stack[0]});
+        for (stack[1..program.num_returns]) |f| {
+            try stdout.print("{d} ", .{f});
         }
-
-        p.num_returns = current_stack_size;
-        return p;
+        try stdout.print("\n", .{});
     }
+}
 
-    fn writeOffset(asm_buf: *AsmBuf, register: u8, offset: u16) !void {
-        const byte_offset = @sizeOf(f64) * offset;
-
-        if (byte_offset <= 0x7f) {
-            try asm_buf.addImmediate(&.{0x40 | register});
-            try asm_buf.addImmediate(&.{@truncate(byte_offset)});
-        } else {
-            try asm_buf.addImmediate(&.{0x80 | register});
-            try asm_buf.addImmediate(std.mem.asBytes(&std.mem.nativeToLittle(u32, byte_offset)));
-        }
-    }
-
-    pub fn compile(
-        self: *const Program,
-        asm_buf: *align(std.mem.page_size) AsmBuf,
-    ) ![256]f64 {
-        comptime std.debug.assert(@import("builtin").cpu.arch == .x86_64);
-
-        var constants = [_]f64{0.0} ** 256;
-        var num_constants: usize = 0;
-
-        for (self.code.slice()) |inst| {
-            switch (inst) {
-                .constant => |c| {
-                    if (std.mem.indexOfScalar(f64, constants[0..num_constants], c) == null) {
-                        constants[num_constants] = c;
-                        num_constants += 1;
-                    }
-                },
-                else => {},
-            }
-        }
-
-        var top: u16 = self.num_args;
-
-        for (self.code.slice()) |inst| {
-            switch (inst) {
-                .add => {
-                    // movsd (8*(top-2))(%rdi), %xmm0
-                    try asm_buf.addInstruction(3, 0xf20f10);
-                    try writeOffset(asm_buf, 0x7, top - 2);
-                    // addsd (8*(top-1))(%rdi), %xmm0
-                    try asm_buf.addInstruction(3, 0xf20f58);
-                    try writeOffset(asm_buf, 0x7, top - 1);
-                    // movsd %xmm0, (8*(top-2))(%rdi)
-                    try asm_buf.addInstruction(3, 0xf20f11);
-                    try writeOffset(asm_buf, 0x7, top - 2);
-                    top -= 1;
-                },
-                .sub => {
-                    // movsd (8*(top-2))(%rdi), %xmm0
-                    try asm_buf.addInstruction(3, 0xf20f10);
-                    try writeOffset(asm_buf, 0x7, top - 2);
-                    // subsd (8*(top-1))(%rdi), %xmm0
-                    try asm_buf.addInstruction(3, 0xf20f5c);
-                    try writeOffset(asm_buf, 0x7, top - 1);
-                    // movsd %xmm0, (8*(top-2))(%rdi)
-                    try asm_buf.addInstruction(3, 0xf20f11);
-                    try writeOffset(asm_buf, 0x7, top - 2);
-                    top -= 1;
-                },
-                .mul => {
-                    // movsd (8*(top-2))(%rdi), %xmm0
-                    try asm_buf.addInstruction(3, 0xf20f10);
-                    try writeOffset(asm_buf, 0x7, top - 2);
-                    // mulsd (8*(top-1))(%rdi), %xmm0
-                    try asm_buf.addInstruction(3, 0xf20f59);
-                    try writeOffset(asm_buf, 0x7, top - 1);
-                    // movsd %xmm0, (8*(top-2))(%rdi)
-                    try asm_buf.addInstruction(3, 0xf20f11);
-                    try writeOffset(asm_buf, 0x7, top - 2);
-                    top -= 1;
-                },
-                .div => {
-                    // movsd (8*(top-2))(%rdi), %xmm0
-                    try asm_buf.addInstruction(3, 0xf20f10);
-                    try writeOffset(asm_buf, 0x7, top - 2);
-                    // divsd (8*(top-1))(%rdi), %xmm0
-                    try asm_buf.addInstruction(3, 0xf20f5e);
-                    try writeOffset(asm_buf, 0x7, top - 1);
-                    // movsd %xmm0, (8*(top-2))(%rdi)
-                    try asm_buf.addInstruction(3, 0xf20f11);
-                    try writeOffset(asm_buf, 0x7, top - 2);
-                    top -= 1;
-                },
-
-                .constant => |c| {
-                    const index = std.mem.indexOfScalar(f64, &constants, c).?;
-                    // movsd (8*index)(%rsi), %xmm0
-                    try asm_buf.addInstruction(3, 0xf20f10);
-                    try writeOffset(asm_buf, 0x6, @intCast(index));
-                    // movsd %xmm0, (8*top)(%rdi)
-                    try asm_buf.addInstruction(3, 0xf20f11);
-                    try writeOffset(asm_buf, 0x7, top);
-                    top += 1;
-                },
-            }
-        }
-
-        // ret
-        try asm_buf.addInstruction(1, 0xc3);
-        return constants;
-    }
-};
-
-const AsmBuf = extern struct {
-    code: [std.mem.page_size - @sizeOf(usize)]u8,
-    len: usize,
-
-    pub fn create() !*align(std.mem.page_size) AsmBuf {
-        const buf: *align(std.mem.page_size) AsmBuf = @ptrCast(try std.os.mmap(
-            null,
-            @sizeOf(AsmBuf),
-            std.os.PROT.READ | std.os.PROT.WRITE,
-            std.os.MAP.ANONYMOUS | std.os.MAP.PRIVATE,
-            -1,
-            0,
-        ));
-        @memset(&buf.code, undefined);
-        buf.len = 0;
-        return buf;
-    }
-
-    pub fn addInstruction(self: *AsmBuf, size: usize, inst: u64) error{Overflow}!void {
-        if (self.len + size > self.code.len) {
-            return error.Overflow;
-        }
-
-        const all_bytes: [8]u8 = @bitCast(std.mem.nativeToBig(u64, inst));
-        const bytes_to_copy = all_bytes[8 - size .. 8];
-        @memcpy(self.code[self.len..][0..size], bytes_to_copy);
-        self.len += size;
-    }
-
-    pub fn addImmediate(self: *AsmBuf, value: []const u8) error{Overflow}!void {
-        if (self.len + value.len > self.code.len) {
-            return error.Overflow;
-        }
-
-        @memcpy(self.code[self.len..][0..value.len], value);
-        self.len += value.len;
-    }
-
-    pub fn finalize(self: *align(std.mem.page_size) AsmBuf) !void {
-        return try std.os.mprotect(std.mem.asBytes(self), std.os.PROT.READ | std.os.PROT.EXEC);
-    }
-
-    pub fn destroy(self: *align(std.mem.page_size) AsmBuf) void {
-        std.os.munmap(std.mem.asBytes(self));
-    }
-};
-
-pub fn main() !void {
-    const argv = try std.process.argsAlloc(std.heap.page_allocator);
-    defer std.heap.page_allocator.free(argv);
-
+fn run(argv: [][:0]u8, stdout: std.fs.File.Writer, stderr: std.fs.File.Writer) !void {
     var buf = try AsmBuf.create();
     defer buf.destroy();
-
-    var stack: [257]f64 = undefined;
 
     if (argv.len != 2) {
         return error.WrongNumberOfArguments;
@@ -218,28 +59,53 @@ pub fn main() !void {
 
     const program = try Program.parse(argv[1]);
     const constants = try program.compile(buf);
-    try buf.finalize();
-    const func: *const fn ([*]f64, [*]const f64) callconv(.C) void = @ptrCast(&buf.code);
+    const func = try buf.finalize(CompiledCode);
 
     var input = std.io.getStdIn().reader();
     var line_buf: [1024]u8 = undefined;
+
+    try stderr.writeAll("> ");
+
     while (try input.readUntilDelimiterOrEof(&line_buf, '\n')) |line| {
-        var it = std.mem.tokenizeScalar(u8, line, ' ');
-        var index: usize = 0;
-        while (it.next()) |substring| {
-            const arg = try std.fmt.parseFloat(f64, substring);
-            stack[index] = arg;
-            index += 1;
-        }
+        var diagnostic = Diagnostic{ .none = {} };
 
-        if (index != program.num_args) {
-            return error.Bleh;
-        }
+        execLine(func, program, line, stdout, &constants, &diagnostic) catch |e| {
+            std.log.err("{s}", .{@errorName(e)});
+            switch (e) {
+                error.WrongNumberOfArguments => std.log.info(
+                    "the supplied program requires {} arguments, but {} were provided",
+                    .{ program.num_args, diagnostic.actual_num_args },
+                ),
+                error.InvalidCharacter => std.log.info(
+                    "\"{s}\" is not a valid number",
+                    .{diagnostic.invalid_numeric_literal},
+                ),
+                else => continue,
+            }
+        };
 
-        func(&stack, &constants);
-        for (stack[0..program.num_returns]) |f| {
-            std.debug.print("{d} ", .{f});
-        }
-        std.debug.print("\n", .{});
+        try stderr.writeAll("> ");
     }
+}
+
+const usage =
+    \\usage: {s} <program>
+    \\    program is a RPN expression which starts with some arguments (user input) already on the
+    \\    stack. supported: decimal constants, +, -, *, /. if program is '+ 2 *', then after running
+    \\    the user enters two numbers, and twice their sum will be printed.
+;
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(gpa.deinit() == .ok);
+    const allocator = gpa.allocator();
+    const argv = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, argv);
+
+    const stdout = std.io.getStdOut().writer();
+    const stderr = std.io.getStdErr().writer();
+
+    run(argv, stdout, stderr) catch |e| switch (e) {
+        else => return e,
+    };
 }
