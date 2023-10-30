@@ -2,8 +2,7 @@ const std = @import("std");
 
 const Program = @import("./program.zig");
 const AsmBuf = @import("./asmbuf.zig").AsmBuf;
-
-const CompiledCode = *const fn (stack: [*]f64, constants: [*]const f64) callconv(.C) void;
+const Compiler = @import("./compiler.zig");
 
 const ExecDiagnostic = union {
     none: void,
@@ -12,7 +11,7 @@ const ExecDiagnostic = union {
 };
 
 fn execLine(
-    code: CompiledCode,
+    code: Compiler.CompiledCode,
     program: Program,
     line: []const u8,
     stdout: std.fs.File.Writer,
@@ -64,16 +63,17 @@ fn run(
 
     const program = try Program.parse(argv[1..], erroneous_part);
     const constants = try program.compile(buf);
-    const func = try buf.finalize(CompiledCode);
+    const func = try buf.finalize(Compiler.CompiledCode);
 
     var input = std.io.getStdIn().reader();
     var line_buf: [1024]u8 = undefined;
 
     try stderr.writeAll("> ");
 
-    while (try input.readUntilDelimiterOrEof(&line_buf, '\n')) |line| {
-        var diagnostic = ExecDiagnostic{ .none = {} };
+    while (try input.readUntilDelimiterOrEof(&line_buf, '\n')) |raw_line| {
+        const line = std.mem.trimRight(u8, raw_line, "\r");
 
+        var diagnostic = ExecDiagnostic{ .none = {} };
         execLine(func, program, line, stdout, &constants, &diagnostic) catch |e| {
             std.log.err("{s}", .{@errorName(e)});
             switch (e) {

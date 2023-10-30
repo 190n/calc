@@ -1,6 +1,8 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const AsmBuf = @import("./asmbuf.zig").AsmBuf;
+const Compiler = @import("./compiler.zig");
 
 const Program = @This();
 
@@ -62,106 +64,12 @@ pub fn parse(texts: [][]const u8, erroneous_part: ?*[]const u8) ParseError!Progr
     return p;
 }
 
-fn writeOffset(asm_buf: *AsmBuf, register: u8, offset: u16) !void {
-    const byte_offset = @sizeOf(f64) * offset;
+pub fn compile(self: Program, asm_buf: *AsmBuf) ![256]f64 {
+    var compiler = Compiler.initWithConstants(self);
 
-    if (byte_offset <= 0x7f) {
-        try asm_buf.addImmediate(&.{0x40 | register});
-        try asm_buf.addImmediate(&.{@truncate(byte_offset)});
-    } else {
-        try asm_buf.addImmediate(&.{0x80 | register});
-        try asm_buf.addImmediate(std.mem.asBytes(&std.mem.nativeToLittle(u32, byte_offset)));
+    for (self.code.slice()) |op| {
+        try compiler.compileOperator(asm_buf, op);
     }
-}
-
-pub fn compile(
-    self: *const Program,
-    asm_buf: *align(std.mem.page_size) AsmBuf,
-) ![256]f64 {
-    comptime std.debug.assert(@import("builtin").cpu.arch == .x86_64);
-
-    var constants = [_]f64{0.0} ** 256;
-    var num_constants: usize = 0;
-
-    for (self.code.slice()) |inst| {
-        switch (inst) {
-            .constant => |c| {
-                if (std.mem.indexOfScalar(f64, constants[0..num_constants], c) == null) {
-                    constants[num_constants] = c;
-                    num_constants += 1;
-                }
-            },
-            else => {},
-        }
-    }
-
-    var top: u16 = self.num_args;
-
-    for (self.code.slice()) |inst| {
-        switch (inst) {
-            .add => {
-                // movsd (8*(top-2))(%rdi), %xmm0
-                try asm_buf.addInstruction(3, 0xf20f10);
-                try writeOffset(asm_buf, 0x7, top - 2);
-                // addsd (8*(top-1))(%rdi), %xmm0
-                try asm_buf.addInstruction(3, 0xf20f58);
-                try writeOffset(asm_buf, 0x7, top - 1);
-                // movsd %xmm0, (8*(top-2))(%rdi)
-                try asm_buf.addInstruction(3, 0xf20f11);
-                try writeOffset(asm_buf, 0x7, top - 2);
-                top -= 1;
-            },
-            .sub => {
-                // movsd (8*(top-2))(%rdi), %xmm0
-                try asm_buf.addInstruction(3, 0xf20f10);
-                try writeOffset(asm_buf, 0x7, top - 2);
-                // subsd (8*(top-1))(%rdi), %xmm0
-                try asm_buf.addInstruction(3, 0xf20f5c);
-                try writeOffset(asm_buf, 0x7, top - 1);
-                // movsd %xmm0, (8*(top-2))(%rdi)
-                try asm_buf.addInstruction(3, 0xf20f11);
-                try writeOffset(asm_buf, 0x7, top - 2);
-                top -= 1;
-            },
-            .mul => {
-                // movsd (8*(top-2))(%rdi), %xmm0
-                try asm_buf.addInstruction(3, 0xf20f10);
-                try writeOffset(asm_buf, 0x7, top - 2);
-                // mulsd (8*(top-1))(%rdi), %xmm0
-                try asm_buf.addInstruction(3, 0xf20f59);
-                try writeOffset(asm_buf, 0x7, top - 1);
-                // movsd %xmm0, (8*(top-2))(%rdi)
-                try asm_buf.addInstruction(3, 0xf20f11);
-                try writeOffset(asm_buf, 0x7, top - 2);
-                top -= 1;
-            },
-            .div => {
-                // movsd (8*(top-2))(%rdi), %xmm0
-                try asm_buf.addInstruction(3, 0xf20f10);
-                try writeOffset(asm_buf, 0x7, top - 2);
-                // divsd (8*(top-1))(%rdi), %xmm0
-                try asm_buf.addInstruction(3, 0xf20f5e);
-                try writeOffset(asm_buf, 0x7, top - 1);
-                // movsd %xmm0, (8*(top-2))(%rdi)
-                try asm_buf.addInstruction(3, 0xf20f11);
-                try writeOffset(asm_buf, 0x7, top - 2);
-                top -= 1;
-            },
-
-            .constant => |c| {
-                const index = std.mem.indexOfScalar(f64, &constants, c).?;
-                // movsd (8*index)(%rsi), %xmm0
-                try asm_buf.addInstruction(3, 0xf20f10);
-                try writeOffset(asm_buf, 0x6, @intCast(index));
-                // movsd %xmm0, (8*top)(%rdi)
-                try asm_buf.addInstruction(3, 0xf20f11);
-                try writeOffset(asm_buf, 0x7, top);
-                top += 1;
-            },
-        }
-    }
-
-    // ret
-    try asm_buf.addInstruction(1, 0xc3);
-    return constants;
+    try compiler.addReturn(asm_buf);
+    return compiler.constants;
 }
