@@ -53,6 +53,9 @@ pub fn compileOperator(self: *Compiler, asm_buf: *AsmBuf, op: Program.Op) !void 
 
     switch (op) {
         .add => {
+            std.log.debug("movsd {}(%rdi), %xmm0", .{8 * (self.stack_top - 2)});
+            std.log.debug("addsd {}(%rdi), %xmm0", .{8 * (self.stack_top - 1)});
+            std.log.debug("movsd %xmm0, {}(%rdi)", .{8 * (self.stack_top - 2)});
             // movsd (8*(top-2))(%rdi), %xmm0
             try asm_buf.addInstruction(3, 0xf20f10);
             try writeOffset(asm_buf, stack, self.stack_top - 2);
@@ -65,6 +68,9 @@ pub fn compileOperator(self: *Compiler, asm_buf: *AsmBuf, op: Program.Op) !void 
             self.stack_top -= 1;
         },
         .sub => {
+            std.log.debug("movsd {}(%rdi), %xmm0", .{8 * (self.stack_top - 2)});
+            std.log.debug("subsd {}(%rdi), %xmm0", .{8 * (self.stack_top - 1)});
+            std.log.debug("movsd %xmm0, {}(%rdi)", .{8 * (self.stack_top - 2)});
             // movsd (8*(top-2))(%rdi), %xmm0
             try asm_buf.addInstruction(3, 0xf20f10);
             try writeOffset(asm_buf, stack, self.stack_top - 2);
@@ -77,6 +83,9 @@ pub fn compileOperator(self: *Compiler, asm_buf: *AsmBuf, op: Program.Op) !void 
             self.stack_top -= 1;
         },
         .mul => {
+            std.log.debug("movsd {}(%rdi), %xmm0", .{8 * (self.stack_top - 2)});
+            std.log.debug("mulsd {}(%rdi), %xmm0", .{8 * (self.stack_top - 1)});
+            std.log.debug("movsd %xmm0, {}(%rdi)", .{8 * (self.stack_top - 2)});
             // movsd (8*(top-2))(%rdi), %xmm0
             try asm_buf.addInstruction(3, 0xf20f10);
             try writeOffset(asm_buf, stack, self.stack_top - 2);
@@ -89,6 +98,9 @@ pub fn compileOperator(self: *Compiler, asm_buf: *AsmBuf, op: Program.Op) !void 
             self.stack_top -= 1;
         },
         .div => {
+            std.log.debug("movsd {}(%rdi), %xmm0", .{8 * (self.stack_top - 2)});
+            std.log.debug("divsd {}(%rdi), %xmm0", .{8 * (self.stack_top - 1)});
+            std.log.debug("movsd %xmm0, {}(%rdi)", .{8 * (self.stack_top - 2)});
             // movsd (8*(top-2))(%rdi), %xmm0
             try asm_buf.addInstruction(3, 0xf20f10);
             try writeOffset(asm_buf, stack, self.stack_top - 2);
@@ -103,6 +115,8 @@ pub fn compileOperator(self: *Compiler, asm_buf: *AsmBuf, op: Program.Op) !void 
 
         .constant => |c| {
             const index = std.mem.indexOfScalar(f64, self.constants.items, c).?;
+            std.log.debug("movsd {}(%rsi), %xmm0", .{8 * index});
+            std.log.debug("movsd %xmm0, {}(%rdi)", .{8 * self.stack_top});
             // movsd (8*index)(%rsi), %xmm0
             try asm_buf.addInstruction(3, 0xf20f10);
             try writeOffset(asm_buf, constants, @intCast(index));
