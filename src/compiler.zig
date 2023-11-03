@@ -8,21 +8,20 @@ const Compiler = @This();
 
 pub const CompiledCode = *const fn (stack: [*]f64, constants: [*]const f64) callconv(.C) void;
 
-constants: [256]f64 = .{0.0} ** 256,
+constants: std.ArrayList(f64),
 stack_top: u16,
 
-pub fn initWithConstants(program: Program) Compiler {
+pub fn initWithConstants(allocator: std.mem.Allocator, program: Program) !Compiler {
     var compiler = Compiler{
+        .constants = std.ArrayList(f64).init(allocator),
         .stack_top = program.num_args,
     };
-    var num_constants: usize = 0;
 
-    for (program.code.slice()) |inst| {
+    for (program.code.items) |inst| {
         switch (inst) {
             .constant => |c| {
-                if (std.mem.indexOfScalar(f64, compiler.constants[0..num_constants], c) == null) {
-                    compiler.constants[num_constants] = c;
-                    num_constants += 1;
+                if (std.mem.indexOfScalar(f64, compiler.constants.items, c) == null) {
+                    try compiler.constants.append(c);
                 }
             },
             else => {},
@@ -103,7 +102,7 @@ pub fn compileOperator(self: *Compiler, asm_buf: *AsmBuf, op: Program.Op) !void 
         },
 
         .constant => |c| {
-            const index = std.mem.indexOfScalar(f64, &self.constants, c).?;
+            const index = std.mem.indexOfScalar(f64, self.constants.items, c).?;
             // movsd (8*index)(%rsi), %xmm0
             try asm_buf.addInstruction(3, 0xf20f10);
             try writeOffset(asm_buf, constants, @intCast(index));
@@ -121,4 +120,8 @@ pub fn addReturn(self: *const Compiler, asm_buf: *AsmBuf) !void {
 
     // ret
     try asm_buf.addInstruction(1, 0xc3);
+}
+
+pub fn getConstants(self: *Compiler) ![]f64 {
+    return self.constants.toOwnedSlice();
 }

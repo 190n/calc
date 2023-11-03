@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const Program = @import("./program.zig");
 const AsmBuf = @import("./asmbuf.zig").AsmBuf;
@@ -53,6 +54,7 @@ fn run(
     stdout: std.fs.File.Writer,
     stderr: std.fs.File.Writer,
     erroneous_part: ?*[]const u8,
+    allocator: std.mem.Allocator,
 ) !void {
     var buf = try AsmBuf.create();
     defer buf.destroy();
@@ -61,8 +63,10 @@ fn run(
         return error.WrongNumberOfArguments;
     }
 
-    const program = try Program.parse(argv[1..], erroneous_part);
+    var program = try Program.parse(allocator, argv[1..], erroneous_part);
+    defer program.deinit();
     const constants = try program.compile(buf);
+    defer allocator.free(constants);
     const func = try buf.finalize(Compiler.CompiledCode);
 
     var input = std.io.getStdIn().reader();
@@ -74,7 +78,7 @@ fn run(
         const line = std.mem.trimRight(u8, raw_line, "\r");
 
         var diagnostic = ExecDiagnostic{ .none = {} };
-        execLine(func, program, line, stdout, &constants, &diagnostic) catch |e| {
+        execLine(func, program, line, stdout, constants, &diagnostic) catch |e| {
             std.log.err("{s}", .{@errorName(e)});
             switch (e) {
                 error.WrongNumberOfArguments => std.log.info(
@@ -102,9 +106,19 @@ const usage =
 ;
 
 pub fn main() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(gpa.deinit() == .ok);
-    const allocator = gpa.allocator();
+
+    const allocator = switch (builtin.mode) {
+        .Debug => gpa.allocator(),
+        else => arena.allocator(),
+    };
+    defer switch (builtin.mode) {
+        .Debug => std.debug.assert(gpa.deinit() == .ok),
+        else => arena.deinit(),
+    };
+
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
 
@@ -120,7 +134,7 @@ pub fn main() !void {
 
     var erroneous_part: []const u8 = &.{};
 
-    run(argv, stdout, stderr, &erroneous_part) catch |e| {
+    run(argv, stdout, stderr, &erroneous_part, allocator) catch |e| {
         std.log.err("{s}", .{@errorName(e)});
         switch (e) {
             error.InvalidProgram => std.log.info("\"{s}\" is not a valid number or operator", .{erroneous_part}),
