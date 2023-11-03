@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const Program = @import("./program.zig");
-const AsmBuf = @import("./asmbuf.zig").AsmBuf;
+const Program = @import("./Program.zig");
+const AsmBuf = @import("./AsmBuf.zig").AsmBuf;
 
 const Compiler = @This();
 
