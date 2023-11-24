@@ -29,19 +29,25 @@ pub const FloatRegister = enum {
     b,
 };
 
+pub const BaseRegisterAndOffset = struct {
+    base: IntRegister,
+    offset: i32,
+};
+
 pub const Operand = union(enum) {
     int_register: IntRegister,
     float_register: FloatRegister,
-    memory: struct {
-        base: IntRegister,
-        offset: i32,
-    },
+    memory: BaseRegisterAndOffset,
 };
 
 pub const Instruction = union(enum) {
-    move: struct {
-        dst: Operand,
-        src: Operand,
+    load: struct {
+        dst: FloatRegister,
+        src: BaseRegisterAndOffset,
+    },
+    store: struct {
+        dst: BaseRegisterAndOffset,
+        src: FloatRegister,
     },
     add_float: struct {
         dst: FloatRegister,
@@ -174,83 +180,121 @@ fn emit(self: *Assembler, comptime T: type, data: T) !void {
     }
 }
 
-fn assembleMove(self: *Assembler, dst: Operand, src: Operand) !void {
+fn assembleLoad(self: *Assembler, dst: FloatRegister, src: BaseRegisterAndOffset) !void {
     switch (self.target.cpu.arch) {
         .x86_64 => {
-            if (src == .memory and dst == .float_register) {
-                // movsd dst, qword [base + offset]
-                try self.emit(u8, 0xf2);
-                try self.emit(u8, 0x0f);
-                try self.emit(u8, 0x10);
-                try self.emitX86Offset(src.memory.base, src.memory.offset, dst.float_register);
-            } else if (src == .float_register and dst == .memory) {
-                // movsd qword [base + offset], src
-                try self.emit(u8, 0xf2);
-                try self.emit(u8, 0x0f);
-                try self.emit(u8, 0x11);
-                try self.emitX86Offset(dst.memory.base, dst.memory.offset, src.float_register);
-            } else unreachable;
+            // movsd dst, qword [base + offset]
+            try self.emit(u8, 0xf2);
+            try self.emit(u8, 0x0f);
+            try self.emit(u8, 0x10);
+            try self.emitX86Offset(src.base, src.offset, dst);
         },
         .riscv64 => {
-            if (src == .memory and dst == .float_register) {
-                if (@mod(src.memory.offset, 8) == 0 and std.math.cast(u8, src.memory.offset) != null) {
-                    // c.fld dst, offset(base)
-                    const offset: u8 = @intCast(src.memory.offset);
-                    try self.emit(
-                        u16,
-                        0b001_00000000000_00 |
-                            @as(u16, self.getRegisterNumber(src.memory.base) & 0b111) << 7 |
-                            (self.getRegisterNumber(dst.float_register) & 0b111) << 2 |
-                            @as(u16, offset & 0b00111000) << 7 |
-                            (offset & 0b11000000) >> 1,
-                    );
-                } else if (std.math.cast(i12, src.memory.offset)) |immediate_offset| {
-                    // fld dst, offset(base)
-                    try self.emit(
-                        u32,
-                        0b011_00000_0000111 |
-                            @as(u32, @as(u12, @bitCast(immediate_offset))) << 20 |
-                            @as(u32, self.getRegisterNumber(src.memory.base)) << 15 |
-                            @as(u32, self.getRegisterNumber(dst.float_register)) << 7,
-                    );
-                } else {
-                    const offset: u32 = @bitCast(src.memory.offset);
-                    // lui a2, offset[31:12]
-                    try self.emit(
-                        u32,
-                        offset & 0xfffff000 | 0b01100_0110111,
-                    );
-                    // addi a2, a2, offset[11:0]
-                    try self.emit(
-                        u32,
-                        (offset & 0x00000fff) << 20 | 0b01100_000_01100_0010011,
-                    );
-                    // c.add a2, base
-                    try self.emit(
-                        u16,
-                        0b100_1_01100_00000_10 | @as(u16, self.getRegisterNumber(src.memory.base) << 2),
-                    );
-                    // c.fld dst, 0(a2)
-                    try self.emit(
-                        u16,
-                        0b001_000_100_00_000_00 |
-                            @as(u16, self.getRegisterNumber(dst.float_register) & 0b111) << 2,
-                    );
-                }
-            } else if (src == .float_register and dst == .memory) {
-                if (@mod(dst.memory.offset, 8) == 0 and std.math.cast(u8, dst.memory.offset) != null) {
-                    // c.fsd src, offset(base)
-                    const offset: u8 = @intCast(dst.memory.offset);
-                    try self.emit(
-                        u16,
-                        0xa000 |
-                            @as(u16, self.getRegisterNumber(dst.memory.base) & 0b111) << 7 |
-                            (self.getRegisterNumber(src.float_register) & 0b111) << 2 |
-                            @as(u16, offset & 0b111000) << 7 |
-                            (offset & 0b11000000) >> 1,
-                    );
-                } else unreachable;
-            } else unreachable;
+            if (@mod(src.offset, 8) == 0 and std.math.cast(u8, src.offset) != null) {
+                // c.fld dst, offset(base)
+                const offset: u8 = @intCast(src.offset);
+                try self.emit(
+                    u16,
+                    0b001_00000000000_00 |
+                        @as(u16, self.getRegisterNumber(src.base) & 0b111) << 7 |
+                        (self.getRegisterNumber(dst) & 0b111) << 2 |
+                        @as(u16, offset & 0b00111000) << 7 |
+                        (offset & 0b11000000) >> 1,
+                );
+            } else if (std.math.cast(i12, src.offset)) |immediate_offset| {
+                // fld dst, offset(base)
+                try self.emit(
+                    u32,
+                    0b011_00000_0000111 |
+                        @as(u32, @as(u12, @bitCast(immediate_offset))) << 20 |
+                        @as(u32, self.getRegisterNumber(src.base)) << 15 |
+                        @as(u32, self.getRegisterNumber(dst)) << 7,
+                );
+            } else {
+                const offset: u32 = @bitCast(src.offset);
+                // lui a2, offset[31:12]
+                try self.emit(
+                    u32,
+                    offset & 0xfffff000 | 0b01100_0110111,
+                );
+                // addi a2, a2, offset[11:0]
+                try self.emit(
+                    u32,
+                    (offset & 0x00000fff) << 20 | 0b01100_000_01100_0010011,
+                );
+                // c.add a2, base
+                try self.emit(
+                    u16,
+                    0b100_1_01100_00000_10 | @as(u16, self.getRegisterNumber(src.base) << 2),
+                );
+                // c.fld dst, 0(a2)
+                try self.emit(
+                    u16,
+                    0b001_000_100_00_000_00 |
+                        @as(u16, self.getRegisterNumber(dst) & 0b111) << 2,
+                );
+            }
+        },
+        else => unreachable,
+    }
+}
+
+fn assembleStore(self: *Assembler, dst: BaseRegisterAndOffset, src: FloatRegister) !void {
+    switch (self.target.cpu.arch) {
+        .x86_64 => {
+            // movsd qword [base + offset], src
+            try self.emit(u8, 0xf2);
+            try self.emit(u8, 0x0f);
+            try self.emit(u8, 0x11);
+            try self.emitX86Offset(dst.base, dst.offset, src);
+        },
+        .riscv64 => {
+            if (@mod(dst.offset, 8) == 0 and std.math.cast(u8, dst.offset) != null) {
+                // c.fsd src, offset(base)
+                const offset: u8 = @intCast(dst.offset);
+                try self.emit(
+                    u16,
+                    0b101_00000000000_00 |
+                        @as(u16, self.getRegisterNumber(dst.base) & 0b111) << 7 |
+                        (self.getRegisterNumber(src) & 0b111) << 2 |
+                        @as(u16, offset & 0b111000) << 7 |
+                        (offset & 0b11000000) >> 1,
+                );
+            } else if (std.math.cast(i12, dst.offset)) |immediate_offset| {
+                // fsd src, offset(base)
+                const offset: u32 = @as(u12, @bitCast(immediate_offset));
+                try self.emit(
+                    u32,
+                    0b011_00000_0100111 |
+                        (offset >> 5) << 25 |
+                        @as(u32, self.getRegisterNumber(src)) << 20 |
+                        @as(u32, self.getRegisterNumber(dst.base)) << 15 |
+                        (offset & 0b11111) << 7,
+                );
+            } else {
+                const offset: u32 = @bitCast(dst.offset);
+                // lui a2, offset[31:12]
+                try self.emit(
+                    u32,
+                    offset & 0xfffff000 | 0b01100_0110111,
+                );
+                // addi a2, a2, offset[11:0]
+                try self.emit(
+                    u32,
+                    (offset & 0x00000fff) << 20 | 0b01100_000_01100_0010011,
+                );
+                // c.add a2, base
+                try self.emit(
+                    u16,
+                    0b100_1_01100_00000_10 | @as(u16, self.getRegisterNumber(dst.base) << 2),
+                );
+                // c.fsd src, 0(a2)
+                try self.emit(
+                    u16,
+                    0b101_000_100_00_000_00 |
+                        @as(u16, self.getRegisterNumber(src) & 0b111) << 2,
+                );
+            }
         },
         else => unreachable,
     }
@@ -258,7 +302,8 @@ fn assembleMove(self: *Assembler, dst: Operand, src: Operand) !void {
 
 pub fn assemble(self: *Assembler, inst: Instruction) !void {
     switch (inst) {
-        .move => |move| try self.assembleMove(move.dst, move.src),
+        .load => |load| try self.assembleLoad(load.dst, load.src),
+        .store => |store| try self.assembleStore(store.dst, store.src),
         else => unreachable,
     }
 }
@@ -308,27 +353,30 @@ fn runAssemblerTest(info: AssemblerTestCase) !void {
     try std.testing.expectEqualSlices(u8, info.expected_riscv64_code, riscv64_assembler.code.writable.items);
 }
 
-test "assemble short programs" {
+test "assemble empty program" {
     // empty/only return instruction
     try runAssemblerTest(.{
         .instructions = &.{},
         .expected_x86_64_code = &.{0xc3},
         .expected_riscv64_code = &.{ 0x82, 0x80 },
     });
+}
+
+test "assemble loads" {
     // loads with various offset sizes
     try runAssemblerTest(.{
         .instructions = &.{
             // different registers
-            .{ .move = .{ .src = .{ .memory = .{ .base = .vm_stack, .offset = 0 } }, .dst = .{ .float_register = .a } } },
-            .{ .move = .{ .src = .{ .memory = .{ .base = .constants, .offset = 0 } }, .dst = .{ .float_register = .b } } },
+            .{ .load = .{ .src = .{ .base = .vm_stack, .offset = 0 }, .dst = .a } },
+            .{ .load = .{ .src = .{ .base = .constants, .offset = 0 }, .dst = .b } },
             // offset 0x78 = 1 byte for x86, still c.fld for riscv
-            .{ .move = .{ .src = .{ .memory = .{ .base = .vm_stack, .offset = 0x78 } }, .dst = .{ .float_register = .a } } },
+            .{ .load = .{ .src = .{ .base = .vm_stack, .offset = 0x78 }, .dst = .a } },
             // offset -8 = 1 byte for x86, uncompressed load for riscv since it is negative
-            .{ .move = .{ .src = .{ .memory = .{ .base = .vm_stack, .offset = -8 } }, .dst = .{ .float_register = .a } } },
+            .{ .load = .{ .src = .{ .base = .vm_stack, .offset = -8 }, .dst = .a } },
             // small offset, but misaligned, so riscv can't use compressed load
-            .{ .move = .{ .src = .{ .memory = .{ .base = .vm_stack, .offset = 1 } }, .dst = .{ .float_register = .a } } },
+            .{ .load = .{ .src = .{ .base = .vm_stack, .offset = 1 }, .dst = .a } },
             // large offset. x86 uses 32-bit immediate and riscv uses several instructions.
-            .{ .move = .{ .src = .{ .memory = .{ .base = .vm_stack, .offset = 0x11223344 } }, .dst = .{ .float_register = .a } } },
+            .{ .load = .{ .src = .{ .base = .vm_stack, .offset = 0x11223344 }, .dst = .a } },
         },
         // zig fmt: off
         .expected_x86_64_code = &.{
@@ -367,6 +415,66 @@ test "assemble short programs" {
             0x2a, 0x96,
             // c.fld fa0, 0(a2)
             0x08, 0x22,
+
+            // ret
+            0x82, 0x80,
+        },
+        // zig fmt: on
+    });
+}
+
+test "assemble stores" {
+    try runAssemblerTest(.{
+        .instructions = &.{
+            // different registers
+            .{ .store = .{ .dst = .{ .base = .vm_stack, .offset = 0 }, .src = .a } },
+            .{ .store = .{ .dst = .{ .base = .constants, .offset = 0 }, .src = .b } },
+            // offset 0x78 = 1 byte for x86, still c.fld for riscv
+            .{ .store = .{ .dst = .{ .base = .vm_stack, .offset = 0x78 }, .src = .a } },
+            // offset -8 = 1 byte for x86, uncompressed store for riscv since it is negative
+            .{ .store = .{ .dst = .{ .base = .vm_stack, .offset = -8 }, .src = .a } },
+            // small offset, but misaligned, so riscv can't use compressed store
+            .{ .store = .{ .dst = .{ .base = .vm_stack, .offset = 1 }, .src = .a } },
+            // large offset. x86 uses 32-bit immediate and riscv uses several instructions.
+            .{ .store = .{ .dst = .{ .base = .vm_stack, .offset = 0x11223344 }, .src = .a } },
+        },
+        // zig fmt: off
+        .expected_x86_64_code = &.{
+            // movsd qword [rdi], xmm0
+            0xf2, 0x0f, 0x11, 0x07,
+            // movsd qword [rsi], xmm1
+            0xf2, 0x0f, 0x11, 0x0e,
+            // movsd qword [rdi + 0x78], xmm0
+            0xf2, 0x0f, 0x11, 0x47, 0x78,
+            // movsd qword [rdi - 8], xmm0
+            0xf2, 0x0f, 0x11, 0x47, 0xf8,
+            // movsd qword [rdi + 1], xmm0
+            0xf2, 0x0f, 0x11, 0x47, 0x01,
+            // movsd qword [rdi + 0x11223344], xmm0
+            0xf2, 0x0f, 0x11, 0x87, 0x44, 0x33, 0x22, 0x11,
+            // ret
+            0xc3,
+        },
+        .expected_riscv64_code = &.{
+            // c.fsd fa0, 0(a0)
+            0x08, 0xa1,
+            // c.fsd fa1, 0(a1)
+            0x8c, 0xa1,
+            // c.fsd fa0, 0x78(a0)
+            0x28, 0xbd,
+            // fsd fa0, -8(a0)
+            0x27, 0x3c, 0xa5, 0xfe,
+            // fsd fa0, 1(a0)
+            0xa7, 0x30, 0xa5, 0x00,
+
+            // lui a2, 0x11223
+            0x37, 0x36, 0x22, 0x11,
+            // addi a2, a2, 0x344
+            0x13, 0x06, 0x46, 0x34,
+            // c.add a2, a0
+            0x2a, 0x96,
+            // c.fsd fa0, 0(a2)
+            0x08, 0xa2,
 
             // ret
             0x82, 0x80,
