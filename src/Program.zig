@@ -6,7 +6,7 @@ const Compiler = @import("./Compiler.zig");
 
 const Program = @This();
 
-pub const Op = union(enum) {
+pub const Operation = union(enum) {
     add: void,
     sub: void,
     mul: void,
@@ -14,7 +14,7 @@ pub const Op = union(enum) {
     constant: f64,
 };
 
-code: std.ArrayListUnmanaged(Op),
+code: std.ArrayListUnmanaged(Operation),
 peak_stack_size: u16 = 0,
 num_args: u16 = 0,
 num_returns: u16 = 0,
@@ -25,7 +25,7 @@ pub const ParseError = std.fmt.ParseFloatError || std.mem.Allocator.Error || err
 pub fn parse(allocator: std.mem.Allocator, texts: [][]const u8, erroneous_part: ?*[]const u8) ParseError!Program {
     var p = Program{
         .allocator = allocator,
-        .code = try std.ArrayListUnmanaged(Op).initCapacity(allocator, 64),
+        .code = try std.ArrayListUnmanaged(Operation).initCapacity(allocator, 64),
     };
     var current_stack_size: u16 = 0;
 

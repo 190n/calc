@@ -28,13 +28,16 @@ pub const AsmBuf = extern struct {
         return buf;
     }
 
-    pub fn addInstruction(self: *AsmBuf, size: usize, inst: u64) error{Overflow}!void {
+    pub fn addInstruction(self: *AsmBuf, size: usize, flip: bool, inst: u64) error{Overflow}!void {
         if (self.len + size > self.code.len) {
             return error.Overflow;
         }
 
-        const all_bytes: [8]u8 = @bitCast(std.mem.nativeToBig(u64, inst));
+        var all_bytes: [8]u8 = @bitCast(std.mem.nativeToBig(u64, inst));
         const bytes_to_copy = all_bytes[8 - size .. 8];
+        if (flip) {
+            std.mem.reverse(u8, bytes_to_copy);
+        }
         @memcpy(self.code[self.len..][0..size], bytes_to_copy);
         self.len += size;
     }
