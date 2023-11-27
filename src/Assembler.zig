@@ -1,10 +1,17 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const Operation = @import("./Program.zig").Operation;
 
 const Assembler = @This();
 
-pub const CompiledCode = *const fn (vm_stack: [*]f64, constants: [*]const f64) callconv(.SysV) void;
+pub const CompiledCode = *const fn (
+    vm_stack: [*]f64,
+    constants: [*]const f64,
+) callconv(switch (builtin.cpu.arch) {
+    .x86_64 => .SysV,
+    else => .C,
+}) void;
 
 const page_size = std.mem.page_size;
 const page_allocator = std.heap.page_allocator;

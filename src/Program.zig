@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const AsmBuf = @import("./AsmBuf.zig").AsmBuf;
+const Assembler = @import("./Assembler.zig");
 const Compiler = @import("./Compiler.zig");
 
 const Program = @This();
@@ -73,12 +73,13 @@ pub fn deinit(self: *Program) void {
     self.* = undefined;
 }
 
-pub fn compile(self: Program, asm_buf: *AsmBuf) ![]f64 {
+pub fn compile(self: Program, assembler: *Assembler) ![]f64 {
     var compiler = try Compiler.initWithConstants(self.allocator, self);
 
+    try assembler.emitPrologue();
     for (self.code.items) |op| {
-        try compiler.compileOperator(asm_buf, op);
+        try compiler.compileOperation(assembler, op);
     }
-    try compiler.addReturn(asm_buf);
+    try assembler.emitEpilogue();
     return compiler.getConstants();
 }

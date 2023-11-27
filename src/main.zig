@@ -2,8 +2,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const Program = @import("./Program.zig");
-const AsmBuf = @import("./AsmBuf.zig").AsmBuf;
+const Assembler = @import("./Assembler.zig");
 const Compiler = @import("./Compiler.zig");
+
+comptime {
+    std.testing.refAllDecls(@This());
+}
 
 const ExecDiagnostic = union {
     none: void,
@@ -12,7 +16,7 @@ const ExecDiagnostic = union {
 };
 
 fn execLine(
-    code: Compiler.CompiledCode,
+    code: Assembler.CompiledCode,
     program: Program,
     line: []const u8,
     stdout: std.fs.File.Writer,
@@ -56,8 +60,8 @@ fn run(
     erroneous_part: ?*[]const u8,
     allocator: std.mem.Allocator,
 ) !void {
-    var buf = try AsmBuf.create();
-    defer buf.destroy();
+    var assembler = try Assembler.init(builtin.target);
+    defer assembler.deinit();
 
     if (argv.len < 2) {
         return error.WrongNumberOfArguments;
@@ -65,9 +69,10 @@ fn run(
 
     var program = try Program.parse(allocator, argv[1..], erroneous_part);
     defer program.deinit();
-    const constants = try program.compile(buf);
+    const constants = try program.compile(&assembler);
     defer allocator.free(constants);
-    const func = try buf.finalize(Compiler.CompiledCode);
+    try assembler.finalize();
+    const func = assembler.getFunctionPointer();
 
     var input = std.io.getStdIn().reader();
     var line_buf: [1024]u8 = undefined;
