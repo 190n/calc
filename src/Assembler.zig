@@ -54,6 +54,21 @@ pub const Instruction = union(enum) {
         src1: FloatRegister,
         src2: FloatRegister,
     },
+    sub_float: struct {
+        dst: FloatRegister,
+        src1: FloatRegister,
+        src2: FloatRegister,
+    },
+    mul_float: struct {
+        dst: FloatRegister,
+        src1: FloatRegister,
+        src2: FloatRegister,
+    },
+    div_float: struct {
+        dst: FloatRegister,
+        src1: FloatRegister,
+        src2: FloatRegister,
+    },
 };
 
 pub fn init(target: std.Target) !Assembler {
@@ -300,11 +315,35 @@ fn assembleStore(self: *Assembler, dst: BaseRegisterAndOffset, src: FloatRegiste
     }
 }
 
+fn assembleAddFloat(self: *Assembler, dst: FloatRegister, src1: FloatRegister, src2: FloatRegister) !void {
+    switch (self.target.cpu.arch) {
+        .x86_64 => {
+            // vaddsd dst, src1, src2
+            try self.emit(u8, 0xc5);
+            try self.emit(u8, 0xc3 | (~self.getRegisterNumber(src2) & 0b111) << 3);
+            try self.emit(u8, 0x58);
+            try self.emit(u8, 0xc0 | self.getRegisterNumber(src1) | self.getRegisterNumber(dst) << 3);
+        },
+        .riscv64 => {
+            // fadd.d dst, src1, src2
+            try self.emit(u32, 0b0000001_00000_00000_111_00000_1010011 |
+                @as(u32, self.getRegisterNumber(src2)) << 20 |
+                @as(u32, self.getRegisterNumber(src1)) << 15 |
+                @as(u32, self.getRegisterNumber(dst)) << 7);
+        },
+        else => unreachable,
+    }
+}
+
 pub fn assemble(self: *Assembler, inst: Instruction) !void {
     switch (inst) {
         .load => |load| try self.assembleLoad(load.dst, load.src),
         .store => |store| try self.assembleStore(store.dst, store.src),
+        .add_float => |add_float| try self.assembleAddFloat(add_float.dst, add_float.src1, add_float.src2),
         else => unreachable,
+        // .sub_float => |sub_float| try self.assembleSubFloat(sub_float.dst, sub_float.src1, sub_float.src2),
+        // .mul_float => |mul_float| try self.assembleMulFloat(mul_float.dst, mul_float.src1, mul_float.src2),
+        // .div_float => |div_float| try self.assembleDivFloat(div_float.dst, div_float.src1, div_float.src2),
     }
 }
 
@@ -476,6 +515,43 @@ test "assemble stores" {
             // c.fsd fa0, 0(a2)
             0x08, 0xa2,
 
+            // ret
+            0x82, 0x80,
+        },
+        // zig fmt: on
+    });
+}
+
+test "assemble adds" {
+    try runAssemblerTest(.{
+        .instructions = &.{
+            .{ .add_float = .{ .dst = .a, .src1 = .a, .src2 = .a } },
+            .{ .add_float = .{ .dst = .a, .src1 = .a, .src2 = .b } },
+            .{ .add_float = .{ .dst = .a, .src1 = .b, .src2 = .a } },
+            .{ .add_float = .{ .dst = .b, .src1 = .a, .src2 = .a } },
+        },
+        // zig fmt: off
+        .expected_x86_64_code = &.{
+            // vaddsd xmm0, xmm0, xmm0
+            0xc5, 0xfb, 0x58, 0xc0,
+            // vaddsd xmm0, xmm0, xmm1
+            0xc5, 0xf3, 0x58, 0xc0,
+            // vaddsd xmm0, xmm1, xmm0
+            0xc5, 0xfb, 0x58, 0xc1,
+            // vaddsd xmm1, xmm0, xmm0
+            0xc5, 0xfb, 0x58, 0xc8,
+            // ret
+            0xc3,
+        },
+        .expected_riscv64_code = &.{
+            // fadd.d fa0, fa0, fa0
+            0x53, 0x75, 0xa5, 0x02,
+            // fadd.d fa0, fa0, fa1
+            0x53, 0x75, 0xb5, 0x02,
+            // fadd.d fa0, fa1, fa0
+            0x53, 0xf5, 0xa5, 0x02,
+            // fadd.d fa1, fa0, fa0
+            0xd3, 0x75, 0xa5, 0x02,
             // ret
             0x82, 0x80,
         },
