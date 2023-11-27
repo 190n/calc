@@ -327,13 +327,73 @@ fn assembleAddFloat(self: *Assembler, dst: FloatRegister, src1: FloatRegister, s
         .x86_64 => {
             // vaddsd dst, src1, src2
             try self.emit(u8, 0xc5);
-            try self.emit(u8, 0xc3 | (~self.getRegisterNumber(src2) & 0b111) << 3);
+            try self.emit(u8, 0xc3 | (~self.getRegisterNumber(src1) & 0b111) << 3);
             try self.emit(u8, 0x58);
-            try self.emit(u8, 0xc0 | self.getRegisterNumber(src1) | self.getRegisterNumber(dst) << 3);
+            try self.emit(u8, 0xc0 | self.getRegisterNumber(dst) << 3 | self.getRegisterNumber(src2));
         },
         .riscv64 => {
             // fadd.d dst, src1, src2
             try self.emit(u32, 0b0000001_00000_00000_111_00000_1010011 |
+                @as(u32, self.getRegisterNumber(src2)) << 20 |
+                @as(u32, self.getRegisterNumber(src1)) << 15 |
+                @as(u32, self.getRegisterNumber(dst)) << 7);
+        },
+        else => unreachable,
+    }
+}
+
+fn assembleSubFloat(self: *Assembler, dst: FloatRegister, src1: FloatRegister, src2: FloatRegister) !void {
+    switch (self.target.cpu.arch) {
+        .x86_64 => {
+            // vsubsd dst, src1, src2
+            try self.emit(u8, 0xc5);
+            try self.emit(u8, 0xc3 | (~self.getRegisterNumber(src1) & 0b111) << 3);
+            try self.emit(u8, 0x5c);
+            try self.emit(u8, 0xc0 | self.getRegisterNumber(dst) << 3 | self.getRegisterNumber(src2));
+        },
+        .riscv64 => {
+            // fsub.d dst, src1, src2
+            try self.emit(u32, 0b0000101_00000_00000_111_00000_1010011 |
+                @as(u32, self.getRegisterNumber(src2)) << 20 |
+                @as(u32, self.getRegisterNumber(src1)) << 15 |
+                @as(u32, self.getRegisterNumber(dst)) << 7);
+        },
+        else => unreachable,
+    }
+}
+
+fn assembleMulFloat(self: *Assembler, dst: FloatRegister, src1: FloatRegister, src2: FloatRegister) !void {
+    switch (self.target.cpu.arch) {
+        .x86_64 => {
+            // vmulsd dst, src1, src2
+            try self.emit(u8, 0xc5);
+            try self.emit(u8, 0xc3 | (~self.getRegisterNumber(src1) & 0b111) << 3);
+            try self.emit(u8, 0x59);
+            try self.emit(u8, 0xc0 | self.getRegisterNumber(dst) << 3 | self.getRegisterNumber(src2));
+        },
+        .riscv64 => {
+            // fmul.d dst, src1, src2
+            try self.emit(u32, 0b0001001_00000_00000_111_00000_1010011 |
+                @as(u32, self.getRegisterNumber(src2)) << 20 |
+                @as(u32, self.getRegisterNumber(src1)) << 15 |
+                @as(u32, self.getRegisterNumber(dst)) << 7);
+        },
+        else => unreachable,
+    }
+}
+
+fn assembleDivFloat(self: *Assembler, dst: FloatRegister, src1: FloatRegister, src2: FloatRegister) !void {
+    switch (self.target.cpu.arch) {
+        .x86_64 => {
+            // vaddsd dst, src1, src2
+            try self.emit(u8, 0xc5);
+            try self.emit(u8, 0xc3 | (~self.getRegisterNumber(src1) & 0b111) << 3);
+            try self.emit(u8, 0x5e);
+            try self.emit(u8, 0xc0 | self.getRegisterNumber(dst) << 3 | self.getRegisterNumber(src2));
+        },
+        .riscv64 => {
+            // fdiv.d dst, src1, src2
+            try self.emit(u32, 0b0001101_00000_00000_111_00000_1010011 |
                 @as(u32, self.getRegisterNumber(src2)) << 20 |
                 @as(u32, self.getRegisterNumber(src1)) << 15 |
                 @as(u32, self.getRegisterNumber(dst)) << 7);
@@ -347,10 +407,9 @@ pub fn assemble(self: *Assembler, inst: Instruction) !void {
         .load => |load| try self.assembleLoad(load.dst, load.src),
         .store => |store| try self.assembleStore(store.dst, store.src),
         .add_float => |add_float| try self.assembleAddFloat(add_float.dst, add_float.src1, add_float.src2),
-        else => unreachable,
-        // .sub_float => |sub_float| try self.assembleSubFloat(sub_float.dst, sub_float.src1, sub_float.src2),
-        // .mul_float => |mul_float| try self.assembleMulFloat(mul_float.dst, mul_float.src1, mul_float.src2),
-        // .div_float => |div_float| try self.assembleDivFloat(div_float.dst, div_float.src1, div_float.src2),
+        .sub_float => |sub_float| try self.assembleSubFloat(sub_float.dst, sub_float.src1, sub_float.src2),
+        .mul_float => |mul_float| try self.assembleMulFloat(mul_float.dst, mul_float.src1, mul_float.src2),
+        .div_float => |div_float| try self.assembleDivFloat(div_float.dst, div_float.src1, div_float.src2),
     }
 }
 
@@ -542,9 +601,9 @@ test "assemble adds" {
             // vaddsd xmm0, xmm0, xmm0
             0xc5, 0xfb, 0x58, 0xc0,
             // vaddsd xmm0, xmm0, xmm1
-            0xc5, 0xf3, 0x58, 0xc0,
-            // vaddsd xmm0, xmm1, xmm0
             0xc5, 0xfb, 0x58, 0xc1,
+            // vaddsd xmm0, xmm1, xmm0
+            0xc5, 0xf3, 0x58, 0xc0,
             // vaddsd xmm1, xmm0, xmm0
             0xc5, 0xfb, 0x58, 0xc8,
             // ret
@@ -559,6 +618,53 @@ test "assemble adds" {
             0x53, 0xf5, 0xa5, 0x02,
             // fadd.d fa1, fa0, fa0
             0xd3, 0x75, 0xa5, 0x02,
+            // ret
+            0x82, 0x80,
+        },
+        // zig fmt: on
+    });
+}
+
+test "assemble other float arithmetic" {
+    try runAssemblerTest(.{
+        .instructions = &.{
+            .{ .sub_float = .{ .dst = .a, .src1 = .a, .src2 = .b } },
+            .{ .sub_float = .{ .dst = .a, .src1 = .b, .src2 = .a } },
+            .{ .mul_float = .{ .dst = .a, .src1 = .a, .src2 = .b } },
+            .{ .mul_float = .{ .dst = .a, .src1 = .b, .src2 = .a } },
+            .{ .div_float = .{ .dst = .a, .src1 = .a, .src2 = .b } },
+            .{ .div_float = .{ .dst = .a, .src1 = .b, .src2 = .a } },
+        },
+        // zig fmt: off
+        .expected_x86_64_code = &.{
+            // vsubsd xmm0, xmm0, xmm1
+            0xc5, 0xfb, 0x5c, 0xc1,
+            // vsubsd xmm0, xmm1, xmm0
+            0xc5, 0xf3, 0x5c, 0xc0,
+            // vmulsd xmm0, xmm0, xmm1
+            0xc5, 0xfb, 0x59, 0xc1,
+            // vmulsd xmm0, xmm1, xmm0
+            0xc5, 0xf3, 0x59, 0xc0,
+            // vdivsd xmm0, xmm0, xmm1
+            0xc5, 0xfb, 0x5e, 0xc1,
+            // vdivsd xmm0, xmm1, xmm0
+            0xc5, 0xf3, 0x5e, 0xc0,
+            // ret
+            0xc3,
+        },
+        .expected_riscv64_code = &.{
+            // fsub.d fa0, fa0, fa1
+            0x53, 0x75, 0xb5, 0x0a,
+            // fsub.d fa0, fa1, fa0
+            0x53, 0xf5, 0xa5, 0x0a,
+            // fmul.d fa0, fa0, fa1
+            0x53, 0x75, 0xb5, 0x12,
+            // fmul.d fa0, fa1, fa0
+            0x53, 0xf5, 0xa5, 0x12,
+            // fdiv.d fa0, fa0, fa1
+            0x53, 0x75, 0xb5, 0x1a,
+            // fdiv.d fa0, fa1, fa0
+            0x53, 0xf5, 0xa5, 0x1a,
             // ret
             0x82, 0x80,
         },

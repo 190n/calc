@@ -39,13 +39,25 @@ pub fn compileOperation(self: *Compiler, assembler: *Assembler, op: Program.Oper
             self.stack_top -= 1;
         },
         .sub => {
-            unreachable;
+            try assembler.assemble(.{ .load = .{ .dst = .a, .src = .{ .base = .vm_stack, .offset = 8 * (self.stack_top - 2) } } });
+            try assembler.assemble(.{ .load = .{ .dst = .b, .src = .{ .base = .vm_stack, .offset = 8 * (self.stack_top - 1) } } });
+            try assembler.assemble(.{ .sub_float = .{ .dst = .a, .src1 = .a, .src2 = .b } });
+            try assembler.assemble(.{ .store = .{ .dst = .{ .base = .vm_stack, .offset = 8 * (self.stack_top - 2) }, .src = .a } });
+            self.stack_top -= 1;
         },
         .mul => {
-            unreachable;
+            try assembler.assemble(.{ .load = .{ .dst = .a, .src = .{ .base = .vm_stack, .offset = 8 * (self.stack_top - 2) } } });
+            try assembler.assemble(.{ .load = .{ .dst = .b, .src = .{ .base = .vm_stack, .offset = 8 * (self.stack_top - 1) } } });
+            try assembler.assemble(.{ .mul_float = .{ .dst = .a, .src1 = .a, .src2 = .b } });
+            try assembler.assemble(.{ .store = .{ .dst = .{ .base = .vm_stack, .offset = 8 * (self.stack_top - 2) }, .src = .a } });
+            self.stack_top -= 1;
         },
         .div => {
-            unreachable;
+            try assembler.assemble(.{ .load = .{ .dst = .a, .src = .{ .base = .vm_stack, .offset = 8 * (self.stack_top - 2) } } });
+            try assembler.assemble(.{ .load = .{ .dst = .b, .src = .{ .base = .vm_stack, .offset = 8 * (self.stack_top - 1) } } });
+            try assembler.assemble(.{ .div_float = .{ .dst = .a, .src1 = .a, .src2 = .b } });
+            try assembler.assemble(.{ .store = .{ .dst = .{ .base = .vm_stack, .offset = 8 * (self.stack_top - 2) }, .src = .a } });
+            self.stack_top -= 1;
         },
 
         .constant => |c| {
