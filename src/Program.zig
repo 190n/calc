@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 
 const Assembler = @import("./Assembler.zig");
 const Compiler = @import("./Compiler.zig");
+const functions = @import("./functions.zig").functions;
 
 const Program = @This();
 
@@ -12,6 +13,7 @@ pub const Operation = union(enum) {
     mul: void,
     div: void,
     constant: f64,
+    call_unary: *const fn (x: f64) callconv(Assembler.calling_convention) f64,
 };
 
 code: std.ArrayListUnmanaged(Operation),
@@ -37,7 +39,14 @@ pub fn parse(allocator: std.mem.Allocator, texts: [][]const u8, erroneous_part: 
                 current_stack_size += 1;
                 p.peak_stack_size = @max(current_stack_size, p.peak_stack_size);
             } else |_| {
-                if (s.len == 1) {
+                if (functions.get(s)) |f| {
+                    try p.code.append(allocator, .{ .call_unary = f });
+                    while (current_stack_size < 1) {
+                        current_stack_size += 1;
+                        p.peak_stack_size += 1;
+                        p.num_args += 1;
+                    }
+                } else if (s.len == 1) {
                     try p.code.append(allocator, switch (s[0]) {
                         '+' => .add,
                         '-' => .sub,
@@ -73,7 +82,7 @@ pub fn deinit(self: *Program) void {
     self.* = undefined;
 }
 
-pub fn compile(self: Program, assembler: *Assembler) ![]f64 {
+pub fn compile(self: Program, assembler: *Assembler) ![]Compiler.Constant {
     var compiler = try Compiler.initWithConstants(self.allocator, self);
 
     try assembler.emitPrologue();

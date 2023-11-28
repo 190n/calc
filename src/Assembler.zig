@@ -2,25 +2,29 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const Operation = @import("./Program.zig").Operation;
+const Constant = @import("./Compiler.zig").Constant;
 
 const Assembler = @This();
 
-pub const CompiledCode = *const fn (
-    vm_stack: [*]f64,
-    constants: [*]const f64,
-) callconv(switch (builtin.cpu.arch) {
+pub const calling_convention: std.builtin.CallingConvention = switch (builtin.cpu.arch) {
+    // unify callconv between linux and windows
     .x86_64 => .SysV,
     else => .C,
-}) void;
+};
+
+pub const CompiledCode = *const fn (
+    vm_stack: [*]f64,
+    constants: [*]const Constant,
+) callconv(calling_convention) void;
 
 const page_size = std.mem.page_size;
-const page_allocator = std.heap.page_allocator;
 
 target: std.Target,
 code: union(enum) {
     writable: std.ArrayListAlignedUnmanaged(u8, page_size),
     executable: []align(page_size) const u8,
 },
+allocator: std.mem.Allocator,
 
 pub const IntRegister = enum {
     /// register used for the first function argument (where a pointer to the VM stack is passed)
@@ -76,25 +80,91 @@ pub const Instruction = union(enum) {
         src1: FloatRegister,
         src2: FloatRegister,
     },
+    call_unary: struct {
+        /// index into constants array
+        index: u28,
+        dst: FloatRegister,
+        src: FloatRegister,
+    },
 };
 
-pub fn init(target: std.Target) !Assembler {
+pub fn init(target: std.Target, allocator: std.mem.Allocator) !Assembler {
     return .{
         .target = target,
         .code = .{
             .writable = try std.ArrayListAlignedUnmanaged(u8, page_size).initCapacity(
-                page_allocator,
+                allocator,
                 page_size,
             ),
         },
+        .allocator = allocator,
     };
 }
 
+fn riscvInstructionsToBytes(comptime instructions: []const u16) []const u8 {
+    var bytes: []const u8 = &.{};
+    for (instructions) |i| {
+        bytes = bytes ++ &[_]u8{ @truncate(i), @truncate(i >> 8) };
+    }
+    return bytes;
+}
+
+const riscv64_prologue = riscvInstructionsToBytes(&.{
+    // allocate 48 bytes of stack space (5*8, rounded up to 16 byte alignment)
+    // c.addi16sp sp, -48
+    0x7179,
+
+    // store ra, fs0, fs1, s0, and s1 on stack
+    // c.sdsp ra, 0(sp)
+    0xe006,
+    // c.fsdsp fs0, 8(sp)
+    0xa422,
+    // c.fsdsp fs1, 16(sp)
+    0xa826,
+    // c.sdsp s0, 24(sp)
+    0xec22,
+    // c.sdsp s1, 32(sp)
+    0xf026,
+
+    // copy a0 and a1 into s0 and s1
+    // c.mv s0, a0
+    0x842a,
+    // c.mv s1, a1
+    0x84ae,
+});
+
+const riscv64_epilogue = riscvInstructionsToBytes(&.{
+    // restore ra, fs0, fs1, s0, and s1 from stack memory
+    // c.ldsp ra, 0(sp)
+    0x6082,
+    // c.fldsp fs0, 8(sp)
+    0x2422,
+    // c.fldsp fs1, 16(sp)
+    0x24c2,
+    // c.ldsp s0, 24(sp)
+    0x6462,
+    // c.ldsp s1, 32(sp)
+    0x7482,
+
+    // pop our 48 byte stack frame
+    // c.addi16sp sp, 48
+    0x6145,
+
+    // return
+    // c.jr ra
+    0x8082,
+});
+
 pub fn emitPrologue(self: *Assembler) !void {
-    // TODO save return address?
     switch (self.target.cpu.arch) {
-        .x86_64 => {},
-        .riscv64 => {},
+        .x86_64 => {
+            // TODO save return address?
+        },
+        .riscv64 => {
+            for (riscv64_prologue) |byte| {
+                try self.emit(u8, byte);
+            }
+        },
         else => unreachable,
     }
 }
@@ -102,7 +172,11 @@ pub fn emitPrologue(self: *Assembler) !void {
 pub fn emitEpilogue(self: *Assembler) !void {
     switch (self.target.cpu.arch) {
         .x86_64 => try self.emit(u8, 0xc3), // ret
-        .riscv64 => try self.emit(u16, 0x8082), // c.jr ra
+        .riscv64 => {
+            for (riscv64_epilogue) |byte| {
+                try self.emit(u8, byte);
+            }
+        },
         else => unreachable,
     }
 }
@@ -120,12 +194,12 @@ pub fn getFunctionPointer(self: *Assembler) CompiledCode {
 
 pub fn deinit(self: *Assembler) void {
     switch (self.code) {
-        .writable => |_| self.code.writable.deinit(page_allocator),
+        .writable => |_| self.code.writable.deinit(self.allocator),
         .executable => |slice| {
             // we need to make the slice writable and non-executable since zig will try to @memset
             // it to 0xaa in debug builds
             std.os.mprotect(@constCast(slice), std.os.PROT.READ | std.os.PROT.WRITE) catch return;
-            page_allocator.free(slice);
+            self.allocator.free(slice);
         },
     }
     self.* = undefined;
@@ -139,8 +213,8 @@ pub fn getRegisterNumber(self: Assembler, reg: anytype) u8 {
                 .constants => 6, // rsi
             },
             .riscv64 => switch (reg) {
-                .vm_stack => 10, // a0
-                .constants => 11, // a1
+                .vm_stack => 8, // s0
+                .constants => 9, // s1
             },
             else => unreachable,
         },
@@ -150,8 +224,8 @@ pub fn getRegisterNumber(self: Assembler, reg: anytype) u8 {
                 .b => 1, // xmm1
             },
             .riscv64 => switch (reg) {
-                .a => 10, // fa0
-                .b => 11, // fa1
+                .a => 8, // fs0
+                .b => 9, // fs1
             },
             else => unreachable,
         },
@@ -177,7 +251,7 @@ fn emit(self: *Assembler, comptime T: type, data: T) !void {
     if (T == u8) {
         // allocate a new page if needed to hold the new byte
         try self.code.writable.ensureTotalCapacityPrecise(
-            page_allocator,
+            self.allocator,
             std.mem.alignForward(usize, self.code.writable.items.len + 1, page_size),
         );
         self.code.writable.appendAssumeCapacity(data);
@@ -190,11 +264,11 @@ fn emit(self: *Assembler, comptime T: type, data: T) !void {
         };
         const shift_amount = 8 * @sizeOf(HalfT);
         switch (self.target.cpu.arch.endian()) {
-            .Little => {
+            .little => {
                 try self.emit(HalfT, @truncate(data));
                 try self.emit(HalfT, @truncate(data >> shift_amount));
             },
-            .Big => {
+            .big => {
                 try self.emit(HalfT, @truncate(data >> shift_amount));
                 try self.emit(HalfT, @truncate(data));
             },
@@ -402,6 +476,76 @@ fn assembleDivFloat(self: *Assembler, dst: FloatRegister, src1: FloatRegister, s
     }
 }
 
+fn assembleCallUnary(
+    self: *Assembler,
+    index: u28,
+    dst: FloatRegister,
+    src: FloatRegister,
+) !void {
+    switch (self.target.cpu.arch) {
+        .x86_64 => {},
+        .riscv64 => {
+            // copy argument register into fa0
+            // fsgnj.d fa0, src, src
+            try self.emit(
+                u32,
+                0b0010001_00000_00000_000_01010_1010011 |
+                    @as(u32, self.getRegisterNumber(src)) << 20 |
+                    @as(u32, self.getRegisterNumber(src)) << 15,
+            );
+            // load address to call into a0
+            if (std.math.cast(u8, 8 * index)) |small_offset| {
+                // c.ld a0, small_offset(constants)
+                try self.emit(
+                    u16,
+                    0b011_000_000_00_010_00 |
+                        @as(u16, self.getRegisterNumber(IntRegister.constants) & 0b111) << 7 |
+                        @as(u16, small_offset & 0b00111000) << 7 |
+                        (small_offset & 0b11000000) >> 1,
+                );
+            } else if (std.math.cast(i12, 8 * index)) |med_offset| {
+                // ld a0, med_offset(constants)
+                try self.emit(
+                    u32,
+                    0b011_01010_0000011 |
+                        @as(u32, @as(u12, @bitCast(med_offset))) << 20 |
+                        @as(u32, self.getRegisterNumber(IntRegister.constants)) << 15,
+                );
+            } else {
+                const offset = 8 * index;
+                // lui a2, offset[31:12]
+                try self.emit(
+                    u32,
+                    offset & 0x0ffff000 | 0b01100_0110111,
+                );
+                // addi a2, a2, offset[11:0]
+                try self.emit(
+                    u32,
+                    (offset & 0x00000fff) << 20 | 0b01100_000_01100_0010011,
+                );
+                // c.add a2, constants
+                try self.emit(
+                    u16,
+                    0b100_1_01100_00000_10 | @as(u16, self.getRegisterNumber(IntRegister.constants) << 2),
+                );
+                // c.ld a0, 0(a2)
+                try self.emit(u16, 0x6208);
+            }
+            // call it
+            // c.jalr a0
+            try self.emit(u16, 0x9502);
+            // copy return value into destination register
+            // fsgnj.d dst, fa0, fa0
+            try self.emit(
+                u32,
+                0b0010001_01010_01010_000_00000_1010011 |
+                    @as(u32, self.getRegisterNumber(dst)) << 7,
+            );
+        },
+        else => unreachable,
+    }
+}
+
 pub fn assemble(self: *Assembler, inst: Instruction) !void {
     switch (inst) {
         .load => |load| try self.assembleLoad(load.dst, load.src),
@@ -410,6 +554,7 @@ pub fn assemble(self: *Assembler, inst: Instruction) !void {
         .sub_float => |sub_float| try self.assembleSubFloat(sub_float.dst, sub_float.src1, sub_float.src2),
         .mul_float => |mul_float| try self.assembleMulFloat(mul_float.dst, mul_float.src1, mul_float.src2),
         .div_float => |div_float| try self.assembleDivFloat(div_float.dst, div_float.src1, div_float.src2),
+        .call_unary => |call_unary| try self.assembleCallUnary(call_unary.index, call_unary.dst, call_unary.src),
     }
 }
 
@@ -440,9 +585,9 @@ const riscv64_target = std.Target{
 };
 
 fn runAssemblerTest(info: AssemblerTestCase) !void {
-    var x86_64_assembler = try Assembler.init(x86_64_target);
+    var x86_64_assembler = try Assembler.init(x86_64_target, std.testing.allocator);
     defer x86_64_assembler.deinit();
-    var riscv64_assembler = try Assembler.init(riscv64_target);
+    var riscv64_assembler = try Assembler.init(riscv64_target, std.testing.allocator);
     defer riscv64_assembler.deinit();
 
     try x86_64_assembler.emitPrologue();
@@ -463,7 +608,7 @@ test "assemble empty program" {
     try runAssemblerTest(.{
         .instructions = &.{},
         .expected_x86_64_code = &.{0xc3},
-        .expected_riscv64_code = &.{ 0x82, 0x80 },
+        .expected_riscv64_code = riscv64_prologue ++ riscv64_epilogue,
     });
 }
 
@@ -500,30 +645,27 @@ test "assemble loads" {
             // ret
             0xc3,
         },
-        .expected_riscv64_code = &.{
-            // c.fld fa0, 0(a0)
-            0x08, 0x21,
-            // c.fld fa1, 0(a1)
-            0x8c, 0x21,
-            // c.fld fa0, 0x78(a0)
-            0x28, 0x3d,
-            // fld fa0, -8(a0)
-            0x07, 0x35, 0x85, 0xff,
-            // fld fa0, 1(a0)
-            0x07, 0x35, 0x15, 0x00,
+        .expected_riscv64_code = riscv64_prologue ++ &[_]u8{
+            // c.fld fs0, 0(s0)
+            0x00, 0x20,
+            // c.fld fs1, 0(s1)
+            0x84, 0x20,
+            // c.fld fs0, 0x78(s0)
+            0x20, 0x3c,
+            // fld fs0, -8(s0)
+            0x07, 0x34, 0x84, 0xff,
+            // fld fs0, 1(s0)
+            0x07, 0x34, 0x14, 0x00,
 
             // lui a2, 0x11223
             0x37, 0x36, 0x22, 0x11,
             // addi a2, a2, 0x344
             0x13, 0x06, 0x46, 0x34,
-            // c.add a2, a0
-            0x2a, 0x96,
-            // c.fld fa0, 0(a2)
-            0x08, 0x22,
-
-            // ret
-            0x82, 0x80,
-        },
+            // c.add a2, s0
+            0x22, 0x96,
+            // c.fld fs0, 0(a2)
+            0x00, 0x22,
+        } ++ riscv64_epilogue,
         // zig fmt: on
     });
 }
@@ -560,30 +702,27 @@ test "assemble stores" {
             // ret
             0xc3,
         },
-        .expected_riscv64_code = &.{
-            // c.fsd fa0, 0(a0)
-            0x08, 0xa1,
-            // c.fsd fa1, 0(a1)
-            0x8c, 0xa1,
-            // c.fsd fa0, 0x78(a0)
-            0x28, 0xbd,
-            // fsd fa0, -8(a0)
-            0x27, 0x3c, 0xa5, 0xfe,
-            // fsd fa0, 1(a0)
-            0xa7, 0x30, 0xa5, 0x00,
+        .expected_riscv64_code = riscv64_prologue ++ &[_]u8{
+            // c.fsd fs0, 0(s0)
+            0x00, 0xa0,
+            // c.fsd fs1, 0(s1)
+            0x84, 0xa0,
+            // c.fsd fs0, 0x78(s0)
+            0x20, 0xbc,
+            // fsd fs0, -8(s0)
+            0x27, 0x3c, 0x84, 0xfe,
+            // fsd fs0, 1(s0)
+            0xa7, 0x30, 0x84, 0x00,
 
             // lui a2, 0x11223
             0x37, 0x36, 0x22, 0x11,
             // addi a2, a2, 0x344
             0x13, 0x06, 0x46, 0x34,
-            // c.add a2, a0
-            0x2a, 0x96,
-            // c.fsd fa0, 0(a2)
-            0x08, 0xa2,
-
-            // ret
-            0x82, 0x80,
-        },
+            // c.add a2, s0
+            0x22, 0x96,
+            // c.fsd fs0, 0(a2)
+            0x00, 0xa2,
+        } ++ riscv64_epilogue,
         // zig fmt: on
     });
 }
@@ -609,18 +748,16 @@ test "assemble adds" {
             // ret
             0xc3,
         },
-        .expected_riscv64_code = &.{
-            // fadd.d fa0, fa0, fa0
-            0x53, 0x75, 0xa5, 0x02,
-            // fadd.d fa0, fa0, fa1
-            0x53, 0x75, 0xb5, 0x02,
-            // fadd.d fa0, fa1, fa0
-            0x53, 0xf5, 0xa5, 0x02,
-            // fadd.d fa1, fa0, fa0
-            0xd3, 0x75, 0xa5, 0x02,
-            // ret
-            0x82, 0x80,
-        },
+        .expected_riscv64_code = riscv64_prologue ++ &[_]u8{
+            // fadd.d fs0, fs0, fs0
+            0x53, 0x74, 0x84, 0x02,
+            // fadd.d fs0, fs0, fs1
+            0x53, 0x74, 0x94, 0x02,
+            // fadd.d fs0, fs1, fs0
+            0x53, 0xf4, 0x84, 0x02,
+            // fadd.d fs1, fs0, fs0
+            0xd3, 0x74, 0x84, 0x02,
+        } ++ riscv64_epilogue,
         // zig fmt: on
     });
 }
@@ -652,28 +789,47 @@ test "assemble other float arithmetic" {
             // ret
             0xc3,
         },
-        .expected_riscv64_code = &.{
-            // fsub.d fa0, fa0, fa1
-            0x53, 0x75, 0xb5, 0x0a,
-            // fsub.d fa0, fa1, fa0
-            0x53, 0xf5, 0xa5, 0x0a,
-            // fmul.d fa0, fa0, fa1
-            0x53, 0x75, 0xb5, 0x12,
-            // fmul.d fa0, fa1, fa0
-            0x53, 0xf5, 0xa5, 0x12,
-            // fdiv.d fa0, fa0, fa1
-            0x53, 0x75, 0xb5, 0x1a,
-            // fdiv.d fa0, fa1, fa0
-            0x53, 0xf5, 0xa5, 0x1a,
-            // ret
-            0x82, 0x80,
+        .expected_riscv64_code = riscv64_prologue ++ &[_]u8{
+            // fsub.d fs0, fs0, fs1
+            0x53, 0x74, 0x94, 0x0a,
+            // fsub.d fs0, fs1, fs0
+            0x53, 0xf4, 0x84, 0x0a,
+            // fmul.d fs0, fs0, fs1
+            0x53, 0x74, 0x94, 0x12,
+            // fmul.d fs0, fs1, fs0
+            0x53, 0xf4, 0x84, 0x12,
+            // fdiv.d fs0, fs0, fs1
+            0x53, 0x74, 0x94, 0x1a,
+            // fdiv.d fs0, fs1, fs0
+            0x53, 0xf4, 0x84, 0x1a,
+        } ++ riscv64_epilogue,
+        // zig fmt: on
+    });
+}
+
+test "assemble calls" {
+    try runAssemblerTest(.{
+        .instructions = &.{
+            .{ .call_unary = .{ .index = 5, .src = .a, .dst = .b } },
         },
+        // zig fmt: off
+        .expected_x86_64_code = &.{0xc3},
+        .expected_riscv64_code = riscv64_prologue ++ &[_]u8{
+            // fsgnj.d fa0, fs0, fs0
+            0x53, 0x05, 0x84, 0x22,
+            // c.ld a0, 40(s1)
+            0x88, 0x74,
+            // c.jalr a0
+            0x02, 0x95,
+            // fsgnj.d fs1, fa0, fa0
+            0xd3, 0x04, 0xa5, 0x22,
+        } ++ riscv64_epilogue,
         // zig fmt: on
     });
 }
 
 test "assembler buffer length is always aligned" {
-    var assembler = try Assembler.init(x86_64_target);
+    var assembler = try Assembler.init(x86_64_target, std.testing.allocator);
     defer assembler.deinit();
     try std.testing.expectEqual(@as(usize, 4096), assembler.code.writable.capacity);
     for (0..4097) |_| {

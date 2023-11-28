@@ -20,7 +20,7 @@ fn execLine(
     program: Program,
     line: []const u8,
     stdout: std.fs.File.Writer,
-    constants: []const f64,
+    constants: []const Compiler.Constant,
     diagnostic: ?*ExecDiagnostic,
 ) !void {
     var it = std.mem.tokenizeScalar(u8, line, ' ');
@@ -60,7 +60,7 @@ fn run(
     erroneous_part: ?*[]const u8,
     allocator: std.mem.Allocator,
 ) !void {
-    var assembler = try Assembler.init(builtin.target);
+    var assembler = try Assembler.init(builtin.target, allocator);
     defer assembler.deinit();
 
     if (argv.len < 2) {
