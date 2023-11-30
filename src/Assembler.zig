@@ -101,10 +101,31 @@ pub fn init(target: std.Target, allocator: std.mem.Allocator) !Assembler {
     };
 }
 
-fn riscvInstructionsToBytes(comptime instructions: []const u16) []const u8 {
+const RiscvInstruction = union(enum) {
+    standard: u32,
+    compressed: u16,
+};
+
+fn rvi32(instruction: u32) RiscvInstruction {
+    return .{ .standard = instruction };
+}
+
+fn rvi16(instruction: u16) RiscvInstruction {
+    return .{ .compressed = instruction };
+}
+
+fn riscvInstructionsToBytes(comptime instructions: []const RiscvInstruction) []const u8 {
     var bytes: []const u8 = &.{};
     for (instructions) |i| {
-        bytes = bytes ++ &[_]u8{ @truncate(i), @truncate(i >> 8) };
+        bytes = bytes ++ switch (i) {
+            .standard => |s| &[_]u8{
+                @truncate(s),
+                @truncate(s >> 8),
+                @truncate(s >> 16),
+                @truncate(s >> 24),
+            },
+            .compressed => |c| &[_]u8{ @truncate(c), @truncate(c >> 8) },
+        };
     }
     return bytes;
 }
@@ -143,47 +164,47 @@ const x86_64_epilogue = &[_]u8{
 const riscv64_prologue = riscvInstructionsToBytes(&.{
     // allocate 48 bytes of stack space (5*8, rounded up to 16 byte alignment)
     // c.addi16sp sp, -48
-    0x7179,
+    rvi16(0x7179),
 
     // store ra, fs0, fs1, s0, and s1 on stack
     // c.sdsp ra, 0(sp)
-    0xe006,
+    rvi16(0xe006),
     // c.fsdsp fs0, 8(sp)
-    0xa422,
+    rvi16(0xa422),
     // c.fsdsp fs1, 16(sp)
-    0xa826,
+    rvi16(0xa826),
     // c.sdsp s0, 24(sp)
-    0xec22,
+    rvi16(0xec22),
     // c.sdsp s1, 32(sp)
-    0xf026,
+    rvi16(0xf026),
 
     // copy a0 and a1 into s0 and s1
     // c.mv s0, a0
-    0x842a,
+    rvi16(0x842a),
     // c.mv s1, a1
-    0x84ae,
+    rvi16(0x84ae),
 });
 
 const riscv64_epilogue = riscvInstructionsToBytes(&.{
     // restore ra, fs0, fs1, s0, and s1 from stack memory
     // c.ldsp ra, 0(sp)
-    0x6082,
+    rvi16(0x6082),
     // c.fldsp fs0, 8(sp)
-    0x2422,
+    rvi16(0x2422),
     // c.fldsp fs1, 16(sp)
-    0x24c2,
+    rvi16(0x24c2),
     // c.ldsp s0, 24(sp)
-    0x6462,
+    rvi16(0x6462),
     // c.ldsp s1, 32(sp)
-    0x7482,
+    rvi16(0x7482),
 
     // pop our 48 byte stack frame
     // c.addi16sp sp, 48
-    0x6145,
+    rvi16(0x6145),
 
     // return
     // c.jr ra
-    0x8082,
+    rvi16(0x8082),
 });
 
 pub fn emitPrologue(self: *Assembler) !void {
@@ -718,36 +739,36 @@ test "assemble loads" {
             // movsd xmm0, qword [rbx + 0x0abbccdd]
             0xf2, 0x0f, 0x10, 0x83, 0xdd, 0xcc, 0xbb, 0x0a,
         } ++ x86_64_epilogue,
-        .expected_riscv64_code = riscv64_prologue ++ &[_]u8{
+        .expected_riscv64_code = riscv64_prologue ++ comptime riscvInstructionsToBytes(&.{
             // c.fld fs0, 0(s0)
-            0x00, 0x20,
+            rvi16(0x2000),
             // c.fld fs1, 0(s1)
-            0x84, 0x20,
+            rvi16(0x2084),
             // c.fld fs0, 0x78(s0)
-            0x20, 0x3c,
+            rvi16(0x3c20),
             // fld fs0, -8(s0)
-            0x07, 0x34, 0x84, 0xff,
+            rvi32(0xff843407),
             // fld fs0, 1(s0)
-            0x07, 0x34, 0x14, 0x00,
+            rvi32(0x00143407),
 
             // lui a2, 0x11223
-            0x37, 0x36, 0x22, 0x11,
+            rvi32(0x11223637),
             // addi a2, a2, 0x344
-            0x13, 0x06, 0x46, 0x34,
+            rvi32(0x34460613),
             // c.add a2, s0
-            0x22, 0x96,
+            rvi16(0x9622),
             // c.fld fs0, 0(a2)
-            0x00, 0x22,
+            rvi16(0x2200),
 
             // lui a2, 0x0abbd
-            0x37, 0xd6, 0xbb, 0x0a,
+            rvi32(0x0abbd637),
             // addi a2, a2, -803
-            0x13, 0x06, 0xd6, 0xcd,
+            rvi32(0xcdd60613),
             // c.add a2, s0
-            0x22, 0x96,
+            rvi16(0x9622),
             // c.fld fs0, 0(a2)
-            0x00, 0x22,
-        } ++ riscv64_epilogue,
+            rvi16(0x2200),
+        }) ++ riscv64_epilogue,
         // zig fmt: on
     });
 }
@@ -786,36 +807,36 @@ test "assemble stores" {
             // movsd qword [rbx + 0x0abbccdd], xmm0
             0xf2, 0x0f, 0x11, 0x83, 0xdd, 0xcc, 0xbb, 0x0a,
         } ++ x86_64_epilogue,
-        .expected_riscv64_code = riscv64_prologue ++ &[_]u8{
+        .expected_riscv64_code = riscv64_prologue ++ comptime riscvInstructionsToBytes(&.{
             // c.fsd fs0, 0(s0)
-            0x00, 0xa0,
+            rvi16(0xa000),
             // c.fsd fs1, 0(s1)
-            0x84, 0xa0,
+            rvi16(0xa084),
             // c.fsd fs0, 0x78(s0)
-            0x20, 0xbc,
+            rvi16(0xbc20),
             // fsd fs0, -8(s0)
-            0x27, 0x3c, 0x84, 0xfe,
+            rvi32(0xfe843c27),
             // fsd fs0, 1(s0)
-            0xa7, 0x30, 0x84, 0x00,
+            rvi32(0x008430a7),
 
             // lui a2, 0x11223
-            0x37, 0x36, 0x22, 0x11,
+            rvi32(0x11223637),
             // addi a2, a2, 0x344
-            0x13, 0x06, 0x46, 0x34,
+            rvi32(0x34460613),
             // c.add a2, s0
-            0x22, 0x96,
+            rvi16(0x9622),
             // c.fsd fs0, 0(a2)
-            0x00, 0xa2,
+            rvi16(0xa200),
 
             // lui a2, 0x0abbd
-            0x37, 0xd6, 0xbb, 0x0a,
+            rvi32(0x0abbd637),
             // addi a2, a2, -803
-            0x13, 0x06, 0xd6, 0xcd,
+            rvi32(0xcdd60613),
             // c.add a2, s0
-            0x22, 0x96,
+            rvi16(0x9622),
             // c.fsd fs0, 0(a2)
-            0x00, 0xa2,
-        } ++ riscv64_epilogue,
+            rvi16(0xa200),
+        }) ++ riscv64_epilogue,
         // zig fmt: on
     });
 }
@@ -839,16 +860,16 @@ test "assemble adds" {
             // vaddsd xmm1, xmm0, xmm0
             0xc5, 0xfb, 0x58, 0xc8,
         } ++ x86_64_epilogue,
-        .expected_riscv64_code = riscv64_prologue ++ &[_]u8{
+        .expected_riscv64_code = riscv64_prologue ++ comptime riscvInstructionsToBytes(&.{
             // fadd.d fs0, fs0, fs0
-            0x53, 0x74, 0x84, 0x02,
+            rvi32(0x02847453),
             // fadd.d fs0, fs0, fs1
-            0x53, 0x74, 0x94, 0x02,
+            rvi32(0x02947453),
             // fadd.d fs0, fs1, fs0
-            0x53, 0xf4, 0x84, 0x02,
+            rvi32(0x0284f453),
             // fadd.d fs1, fs0, fs0
-            0xd3, 0x74, 0x84, 0x02,
-        } ++ riscv64_epilogue,
+            rvi32(0x028474d3),
+        }) ++ riscv64_epilogue,
         // zig fmt: on
     });
 }
@@ -878,20 +899,20 @@ test "assemble other float arithmetic" {
             // vdivsd xmm0, xmm1, xmm0
             0xc5, 0xf3, 0x5e, 0xc0,
         } ++ x86_64_epilogue,
-        .expected_riscv64_code = riscv64_prologue ++ &[_]u8{
+        .expected_riscv64_code = riscv64_prologue ++ comptime riscvInstructionsToBytes(&.{
             // fsub.d fs0, fs0, fs1
-            0x53, 0x74, 0x94, 0x0a,
+            rvi32(0x0a947453),
             // fsub.d fs0, fs1, fs0
-            0x53, 0xf4, 0x84, 0x0a,
+            rvi32(0x0a84f453),
             // fmul.d fs0, fs0, fs1
-            0x53, 0x74, 0x94, 0x12,
+            rvi32(0x12947453),
             // fmul.d fs0, fs1, fs0
-            0x53, 0xf4, 0x84, 0x12,
+            rvi32(0x1284f453),
             // fdiv.d fs0, fs0, fs1
-            0x53, 0x74, 0x94, 0x1a,
+            rvi32(0x1a947453),
             // fdiv.d fs0, fs1, fs0
-            0x53, 0xf4, 0x84, 0x1a,
-        } ++ riscv64_epilogue,
+            rvi32(0x1a84f453),
+        }) ++ riscv64_epilogue,
         // zig fmt: on
     });
 }
@@ -929,40 +950,40 @@ test "assemble calls" {
             // call [rbp + 2048]
             0xff, 0x95, 0x00, 0x08, 0x00, 0x00,
         } ++ x86_64_epilogue,
-        .expected_riscv64_code = riscv64_prologue ++ &[_]u8{
+        .expected_riscv64_code = riscv64_prologue ++ comptime riscvInstructionsToBytes(&.{
             // fsgnj.d fa0, fs0, fs0
-            0x53, 0x05, 0x84, 0x22,
+            rvi32(0x22840553),
             // c.ld a0, 40(s1)
-            0x88, 0x74,
+            rvi16(0x7488),
             // c.jalr a0
-            0x02, 0x95,
+            rvi16(0x9502),
             // fsgnj.d fs1, fa0, fa0
-            0xd3, 0x04, 0xa5, 0x22,
+            rvi32(0x22a504d3),
 
             // fsgnj.d fa0, fs1, fs1
-            0x53, 0x85, 0x94, 0x22,
+            rvi32(0x22948553),
             // ld a0, 256(s1)
-            0x03, 0xb5, 0x04, 0x10,
+            rvi32(0x1004b503),
             // c.jalr a0
-            0x02, 0x95,
+            rvi16(0x9502),
             // fsgnj.d fs0, fa0, fa0
-            0x53, 0x04, 0xa5, 0x22,
+            rvi32(0x22a50453),
 
             // fsgnj.d fa0, fs1, fs1
-            0x53, 0x05, 0x84, 0x22,
+            rvi32(0x22840553),
             // lui a2, 0
-            0x37, 0x16, 0x00, 0x00,
+            rvi32(0x00001637),
             // addi a2, a2, 0x800
-            0x13, 0x06, 0x06, 0x80,
+            rvi32(0x80060613),
             // c.add a2, s1
-            0x26, 0x96,
+            rvi16(0x9626),
             // c.ld a0, 0(a2)
-            0x08, 0x62,
+            rvi16(0x6208),
             // c.jalr a0
-            0x02, 0x95,
+            rvi16(0x9502),
             // fsgnj.d fs0, fa0, fa0
-            0x53, 0x04, 0xa5, 0x22,
-        } ++ riscv64_epilogue,
+            rvi32(0x22a50453),
+        }) ++ riscv64_epilogue,
         // zig fmt: on
     });
 }
