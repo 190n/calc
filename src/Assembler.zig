@@ -109,17 +109,33 @@ fn riscvInstructionsToBytes(comptime instructions: []const u16) []const u8 {
     return bytes;
 }
 
+// zig fmt: off
 const x86_64_prologue = &[_]u8{
-    // 16 bytes for saving xmm0 and xmm1 across function calls, and 8 bytes to keep stack aligned
-    // since the return address was pushed
-    // sub rsp, 24
-    0x48, 0x83, 0xec, 0x18,
+    // 24 bytes for saving a FP register across function calls and for saving rbx and rbp
+    // for the caller
+    // push rbx
+    0x53,
+    // push rbp
+    0x55,
+    // use rax as an arbitrary register -- we don't actually care about the pushed value here
+    // push rax
+    0x50,
+    // now copy the arguments into saved registers
+    // mov rbx, rdi
+    0x48, 0x89, 0xfb,
+    // mov rbp, rsi
+    0x48, 0x89, 0xf5,
 };
+// zig fmt: on
 
 const x86_64_epilogue = &[_]u8{
-    // restore stack
-    // add rsp, 24
-    0x48, 0x83, 0xc4, 0x18,
+    // restore values from stack
+    // pop rax
+    0x58,
+    // pop rbp
+    0x5d,
+    // pop rbx
+    0x5b,
     // ret
     0xc3,
 };
@@ -218,8 +234,8 @@ pub fn getRegisterNumber(self: Assembler, reg: anytype) u8 {
     return switch (@TypeOf(reg)) {
         IntRegister => switch (self.target.cpu.arch) {
             .x86_64 => switch (reg) {
-                .vm_stack => 7, // rdi
-                .constants => 6, // rsi
+                .vm_stack => 3, // rbx
+                .constants => 5, // rbp
             },
             .riscv64 => switch (reg) {
                 .vm_stack => 8, // s0
@@ -245,13 +261,16 @@ pub fn getRegisterNumber(self: Assembler, reg: anytype) u8 {
 fn emitX86Offset(self: *Assembler, base: IntRegister, full_offset: i32, register_operand: FloatRegister) !void {
     const base_num = self.getRegisterNumber(base);
     const reg_num = self.getRegisterNumber(register_operand);
-    if (full_offset == 0) {
+    if (full_offset == 0 and base_num != 5) {
         try self.emit(u8, (reg_num << 3) | base_num);
+        if (base_num == 4) try self.emit(u8, 0x24);
     } else if (std.math.cast(i8, full_offset)) |offset| {
         try self.emit(u8, 0x40 | (reg_num << 3) | base_num);
+        if (base_num == 4) try self.emit(u8, 0x24);
         try self.emit(u8, @bitCast(offset));
     } else {
         try self.emit(u8, 0x80 | (reg_num << 3) | base_num);
+        if (base_num == 4) try self.emit(u8, 0x24);
         try self.emit(u32, @bitCast(full_offset));
     }
 }
@@ -499,7 +518,53 @@ fn assembleCallUnary(
     src: FloatRegister,
 ) !void {
     switch (self.target.cpu.arch) {
-        .x86_64 => {},
+        .x86_64 => {
+            // if src != dst, push src to stack
+            if (src != dst) {
+                // movsd qword [rsp], src
+                try self.emit(u8, 0xf2);
+                try self.emit(u8, 0x0f);
+                try self.emit(u8, 0x11);
+                try self.emit(u8, 0x04 | (self.getRegisterNumber(src) << 3));
+                try self.emit(u8, 0x24);
+            }
+
+            if (src != .a) {
+                // movsd xmm0, src
+                try self.emit(u8, 0xf2);
+                try self.emit(u8, 0x0f);
+                try self.emit(u8, 0x10);
+                try self.emit(u8, 0xc0 | self.getRegisterNumber(src));
+            }
+
+            // call [constants + 8 * index]
+            try self.emit(u8, 0xff);
+            if (8 * index < 128) {
+                try self.emit(u8, 0x50 | self.getRegisterNumber(IntRegister.constants));
+                try self.emit(u8, @intCast(8 * index));
+            } else {
+                try self.emit(u8, 0x90 | self.getRegisterNumber(IntRegister.constants));
+                try self.emit(u32, @intCast(8 * index));
+            }
+
+            if (dst != .a) {
+                // movsd dst, xmm0
+                try self.emit(u8, 0xf2);
+                try self.emit(u8, 0x0f);
+                try self.emit(u8, 0x10);
+                try self.emit(u8, 0xc0 | (self.getRegisterNumber(dst) << 3));
+            }
+
+            // if src != dst, restore src from stack
+            if (src != dst) {
+                // movsd src, qword [rsp]
+                try self.emit(u8, 0xf2);
+                try self.emit(u8, 0x0f);
+                try self.emit(u8, 0x10);
+                try self.emit(u8, 0x04 | (self.getRegisterNumber(src) << 3));
+                try self.emit(u8, 0x24);
+            }
+        },
         .riscv64 => {
             // copy argument register into fa0
             // fsgnj.d fa0, src, src
@@ -638,20 +703,20 @@ test "assemble loads" {
         },
         // zig fmt: off
         .expected_x86_64_code = x86_64_prologue ++ &[_]u8{
-            // movsd xmm0, qword [rdi]
-            0xf2, 0x0f, 0x10, 0x07,
-            // movsd xmm1, qword [rsi]
-            0xf2, 0x0f, 0x10, 0x0e,
-            // movsd xmm0, qword [rdi + 0x78]
-            0xf2, 0x0f, 0x10, 0x47, 0x78,
-            // movsd xmm0, qword [rdi - 8]
-            0xf2, 0x0f, 0x10, 0x47, 0xf8,
-            // movsd xmm0, qword [rdi + 1]
-            0xf2, 0x0f, 0x10, 0x47, 0x01,
-            // movsd xmm0, qword [rdi + 0x11223344]
-            0xf2, 0x0f, 0x10, 0x87, 0x44, 0x33, 0x22, 0x11,
-            // movsd xmm0, qword [rdi + 0x0abbccdd]
-            0xf2, 0x0f, 0x10, 0x87, 0xdd, 0xcc, 0xbb, 0x0a,
+            // movsd xmm0, qword [rbx]
+            0xf2, 0x0f, 0x10, 0x03,
+            // movsd xmm1, qword [rbp]
+            0xf2, 0x0f, 0x10, 0x4d, 0x00,
+            // movsd xmm0, qword [rbx + 0x78]
+            0xf2, 0x0f, 0x10, 0x43, 0x78,
+            // movsd xmm0, qword [rbx - 8]
+            0xf2, 0x0f, 0x10, 0x43, 0xf8,
+            // movsd xmm0, qword [rbx + 1]
+            0xf2, 0x0f, 0x10, 0x43, 0x01,
+            // movsd xmm0, qword [rbx + 0x11223344]
+            0xf2, 0x0f, 0x10, 0x83, 0x44, 0x33, 0x22, 0x11,
+            // movsd xmm0, qword [rbx + 0x0abbccdd]
+            0xf2, 0x0f, 0x10, 0x83, 0xdd, 0xcc, 0xbb, 0x0a,
         } ++ x86_64_epilogue,
         .expected_riscv64_code = riscv64_prologue ++ &[_]u8{
             // c.fld fs0, 0(s0)
@@ -706,20 +771,20 @@ test "assemble stores" {
         },
         // zig fmt: off
         .expected_x86_64_code = x86_64_prologue ++ &[_]u8{
-            // movsd qword [rdi], xmm0
-            0xf2, 0x0f, 0x11, 0x07,
-            // movsd qword [rsi], xmm1
-            0xf2, 0x0f, 0x11, 0x0e,
-            // movsd qword [rdi + 0x78], xmm0
-            0xf2, 0x0f, 0x11, 0x47, 0x78,
-            // movsd qword [rdi - 8], xmm0
-            0xf2, 0x0f, 0x11, 0x47, 0xf8,
-            // movsd qword [rdi + 1], xmm0
-            0xf2, 0x0f, 0x11, 0x47, 0x01,
-            // movsd qword [rdi + 0x11223344], xmm0
-            0xf2, 0x0f, 0x11, 0x87, 0x44, 0x33, 0x22, 0x11,
-            // movsd qword [rdi + 0x0abbccdd], xmm0
-            0xf2, 0x0f, 0x11, 0x87, 0xdd, 0xcc, 0xbb, 0x0a,
+            // movsd qword [rbx], xmm0
+            0xf2, 0x0f, 0x11, 0x03,
+            // movsd qword [rbp], xmm1
+            0xf2, 0x0f, 0x11, 0x4d, 0x00,
+            // movsd qword [rbx + 0x78], xmm0
+            0xf2, 0x0f, 0x11, 0x43, 0x78,
+            // movsd qword [rbx - 8], xmm0
+            0xf2, 0x0f, 0x11, 0x43, 0xf8,
+            // movsd qword [rbx + 1], xmm0
+            0xf2, 0x0f, 0x11, 0x43, 0x01,
+            // movsd qword [rbx + 0x11223344], xmm0
+            0xf2, 0x0f, 0x11, 0x83, 0x44, 0x33, 0x22, 0x11,
+            // movsd qword [rbx + 0x0abbccdd], xmm0
+            0xf2, 0x0f, 0x11, 0x83, 0xdd, 0xcc, 0xbb, 0x0a,
         } ++ x86_64_epilogue,
         .expected_riscv64_code = riscv64_prologue ++ &[_]u8{
             // c.fsd fs0, 0(s0)
@@ -842,7 +907,28 @@ test "assemble calls" {
             .{ .call_unary = .{ .index = 256, .src = .a, .dst = .a } },
         },
         // zig fmt: off
-        .expected_x86_64_code = x86_64_prologue ++ x86_64_epilogue,
+        .expected_x86_64_code = x86_64_prologue ++ &[_]u8{
+            // movsd qword [rsp], xmm0
+            0xf2, 0x0f, 0x11, 0x04, 0x24,
+            // call [rbp + 40]
+            0xff, 0x55, 0x28,
+            // movsd xmm1, xmm0
+            0xf2, 0x0f, 0x10, 0xc8,
+            // movsd xmm0, qword [rsp]
+            0xf2, 0x0f, 0x10, 0x04, 0x24,
+
+            // movsd qword [rsp], xmm1
+            0xf2, 0x0f, 0x11, 0x0c, 0x24,
+            // movsd xmm0, xmm1
+            0xf2, 0x0f, 0x10, 0xc1,
+            // call [rbp + 256]
+            0xff, 0x95, 0x00, 0x01, 0x00, 0x00,
+            // movsd xmm1, qword [rsp]
+            0xf2, 0x0f, 0x10, 0x0c, 0x24,
+
+            // call [rbp + 2048]
+            0xff, 0x95, 0x00, 0x08, 0x00, 0x00,
+        } ++ x86_64_epilogue,
         .expected_riscv64_code = riscv64_prologue ++ &[_]u8{
             // fsgnj.d fa0, fs0, fs0
             0x53, 0x05, 0x84, 0x22,
