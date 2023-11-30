@@ -109,6 +109,21 @@ fn riscvInstructionsToBytes(comptime instructions: []const u16) []const u8 {
     return bytes;
 }
 
+const x86_64_prologue = &[_]u8{
+    // 16 bytes for saving xmm0 and xmm1 across function calls, and 8 bytes to keep stack aligned
+    // since the return address was pushed
+    // sub rsp, 24
+    0x48, 0x83, 0xec, 0x18,
+};
+
+const x86_64_epilogue = &[_]u8{
+    // restore stack
+    // add rsp, 24
+    0x48, 0x83, 0xc4, 0x18,
+    // ret
+    0xc3,
+};
+
 const riscv64_prologue = riscvInstructionsToBytes(&.{
     // allocate 48 bytes of stack space (5*8, rounded up to 16 byte alignment)
     // c.addi16sp sp, -48
@@ -156,28 +171,22 @@ const riscv64_epilogue = riscvInstructionsToBytes(&.{
 });
 
 pub fn emitPrologue(self: *Assembler) !void {
-    switch (self.target.cpu.arch) {
-        .x86_64 => {
-            // TODO save return address?
-        },
-        .riscv64 => {
-            for (riscv64_prologue) |byte| {
-                try self.emit(u8, byte);
-            }
-        },
+    for (switch (self.target.cpu.arch) {
+        .x86_64 => x86_64_prologue,
+        .riscv64 => riscv64_prologue,
         else => unreachable,
+    }) |byte| {
+        try self.emit(u8, byte);
     }
 }
 
 pub fn emitEpilogue(self: *Assembler) !void {
-    switch (self.target.cpu.arch) {
-        .x86_64 => try self.emit(u8, 0xc3), // ret
-        .riscv64 => {
-            for (riscv64_epilogue) |byte| {
-                try self.emit(u8, byte);
-            }
-        },
+    for (switch (self.target.cpu.arch) {
+        .x86_64 => x86_64_epilogue,
+        .riscv64 => riscv64_epilogue,
         else => unreachable,
+    }) |byte| {
+        try self.emit(u8, byte);
     }
 }
 
@@ -276,6 +285,33 @@ fn emit(self: *Assembler, comptime T: type, data: T) !void {
     }
 }
 
+fn loadRiscv64ImmediateInA2(self: *Assembler, signed_value: i32) !void {
+    const value: u32 = @bitCast(signed_value);
+    if ((value & 0xfff) < 0x800) {
+        // lui a2, value[31:12]
+        try self.emit(
+            u32,
+            value & 0xfffff000 | 0b01100_0110111,
+        );
+        // addi a2, a2, value[11:0]
+        try self.emit(
+            u32,
+            (value & 0x00000fff) << 20 | 0b01100_000_01100_0010011,
+        );
+    } else {
+        // lui a2, value[31:12] + 1
+        try self.emit(
+            u32,
+            (value + (1 << 12) & 0xfffff000) | 0b01100_0110111,
+        );
+        // addi a2, a2, value[11:0]
+        try self.emit(
+            u32,
+            (value & 0x00000fff) << 20 | 0b01100_000_01100_0010011,
+        );
+    }
+}
+
 fn assembleLoad(self: *Assembler, dst: FloatRegister, src: BaseRegisterAndOffset) !void {
     switch (self.target.cpu.arch) {
         .x86_64 => {
@@ -307,17 +343,7 @@ fn assembleLoad(self: *Assembler, dst: FloatRegister, src: BaseRegisterAndOffset
                         @as(u32, self.getRegisterNumber(dst)) << 7,
                 );
             } else {
-                const offset: u32 = @bitCast(src.offset);
-                // lui a2, offset[31:12]
-                try self.emit(
-                    u32,
-                    offset & 0xfffff000 | 0b01100_0110111,
-                );
-                // addi a2, a2, offset[11:0]
-                try self.emit(
-                    u32,
-                    (offset & 0x00000fff) << 20 | 0b01100_000_01100_0010011,
-                );
+                try self.loadRiscv64ImmediateInA2(src.offset);
                 // c.add a2, base
                 try self.emit(
                     u16,
@@ -368,17 +394,7 @@ fn assembleStore(self: *Assembler, dst: BaseRegisterAndOffset, src: FloatRegiste
                         (offset & 0b11111) << 7,
                 );
             } else {
-                const offset: u32 = @bitCast(dst.offset);
-                // lui a2, offset[31:12]
-                try self.emit(
-                    u32,
-                    offset & 0xfffff000 | 0b01100_0110111,
-                );
-                // addi a2, a2, offset[11:0]
-                try self.emit(
-                    u32,
-                    (offset & 0x00000fff) << 20 | 0b01100_000_01100_0010011,
-                );
+                try self.loadRiscv64ImmediateInA2(dst.offset);
                 // c.add a2, base
                 try self.emit(
                     u16,
@@ -512,17 +528,7 @@ fn assembleCallUnary(
                         @as(u32, self.getRegisterNumber(IntRegister.constants)) << 15,
                 );
             } else {
-                const offset = 8 * index;
-                // lui a2, offset[31:12]
-                try self.emit(
-                    u32,
-                    offset & 0x0ffff000 | 0b01100_0110111,
-                );
-                // addi a2, a2, offset[11:0]
-                try self.emit(
-                    u32,
-                    (offset & 0x00000fff) << 20 | 0b01100_000_01100_0010011,
-                );
+                try self.loadRiscv64ImmediateInA2(8 * index);
                 // c.add a2, constants
                 try self.emit(
                     u16,
@@ -607,7 +613,7 @@ test "assemble empty program" {
     // empty/only return instruction
     try runAssemblerTest(.{
         .instructions = &.{},
-        .expected_x86_64_code = &.{0xc3},
+        .expected_x86_64_code = x86_64_prologue ++ x86_64_epilogue,
         .expected_riscv64_code = riscv64_prologue ++ riscv64_epilogue,
     });
 }
@@ -627,9 +633,11 @@ test "assemble loads" {
             .{ .load = .{ .src = .{ .base = .vm_stack, .offset = 1 }, .dst = .a } },
             // large offset. x86 uses 32-bit immediate and riscv uses several instructions.
             .{ .load = .{ .src = .{ .base = .vm_stack, .offset = 0x11223344 }, .dst = .a } },
+            // large offset and bit 11 is 1, so riscv has to account for sign extension
+            .{ .load = .{ .src = .{ .base = .vm_stack, .offset = 0x0abbccdd }, .dst = .a } },
         },
         // zig fmt: off
-        .expected_x86_64_code = &.{
+        .expected_x86_64_code = x86_64_prologue ++ &[_]u8{
             // movsd xmm0, qword [rdi]
             0xf2, 0x0f, 0x10, 0x07,
             // movsd xmm1, qword [rsi]
@@ -642,9 +650,9 @@ test "assemble loads" {
             0xf2, 0x0f, 0x10, 0x47, 0x01,
             // movsd xmm0, qword [rdi + 0x11223344]
             0xf2, 0x0f, 0x10, 0x87, 0x44, 0x33, 0x22, 0x11,
-            // ret
-            0xc3,
-        },
+            // movsd xmm0, qword [rdi + 0x0abbccdd]
+            0xf2, 0x0f, 0x10, 0x87, 0xdd, 0xcc, 0xbb, 0x0a,
+        } ++ x86_64_epilogue,
         .expected_riscv64_code = riscv64_prologue ++ &[_]u8{
             // c.fld fs0, 0(s0)
             0x00, 0x20,
@@ -661,6 +669,15 @@ test "assemble loads" {
             0x37, 0x36, 0x22, 0x11,
             // addi a2, a2, 0x344
             0x13, 0x06, 0x46, 0x34,
+            // c.add a2, s0
+            0x22, 0x96,
+            // c.fld fs0, 0(a2)
+            0x00, 0x22,
+
+            // lui a2, 0x0abbd
+            0x37, 0xd6, 0xbb, 0x0a,
+            // addi a2, a2, -803
+            0x13, 0x06, 0xd6, 0xcd,
             // c.add a2, s0
             0x22, 0x96,
             // c.fld fs0, 0(a2)
@@ -684,9 +701,11 @@ test "assemble stores" {
             .{ .store = .{ .dst = .{ .base = .vm_stack, .offset = 1 }, .src = .a } },
             // large offset. x86 uses 32-bit immediate and riscv uses several instructions.
             .{ .store = .{ .dst = .{ .base = .vm_stack, .offset = 0x11223344 }, .src = .a } },
+            // large offset where riscv accounts for sign extension
+            .{ .store = .{ .dst = .{ .base = .vm_stack, .offset = 0x0abbccdd }, .src = .a } },
         },
         // zig fmt: off
-        .expected_x86_64_code = &.{
+        .expected_x86_64_code = x86_64_prologue ++ &[_]u8{
             // movsd qword [rdi], xmm0
             0xf2, 0x0f, 0x11, 0x07,
             // movsd qword [rsi], xmm1
@@ -699,9 +718,9 @@ test "assemble stores" {
             0xf2, 0x0f, 0x11, 0x47, 0x01,
             // movsd qword [rdi + 0x11223344], xmm0
             0xf2, 0x0f, 0x11, 0x87, 0x44, 0x33, 0x22, 0x11,
-            // ret
-            0xc3,
-        },
+            // movsd qword [rdi + 0x0abbccdd], xmm0
+            0xf2, 0x0f, 0x11, 0x87, 0xdd, 0xcc, 0xbb, 0x0a,
+        } ++ x86_64_epilogue,
         .expected_riscv64_code = riscv64_prologue ++ &[_]u8{
             // c.fsd fs0, 0(s0)
             0x00, 0xa0,
@@ -722,6 +741,15 @@ test "assemble stores" {
             0x22, 0x96,
             // c.fsd fs0, 0(a2)
             0x00, 0xa2,
+
+            // lui a2, 0x0abbd
+            0x37, 0xd6, 0xbb, 0x0a,
+            // addi a2, a2, -803
+            0x13, 0x06, 0xd6, 0xcd,
+            // c.add a2, s0
+            0x22, 0x96,
+            // c.fsd fs0, 0(a2)
+            0x00, 0xa2,
         } ++ riscv64_epilogue,
         // zig fmt: on
     });
@@ -736,7 +764,7 @@ test "assemble adds" {
             .{ .add_float = .{ .dst = .b, .src1 = .a, .src2 = .a } },
         },
         // zig fmt: off
-        .expected_x86_64_code = &.{
+        .expected_x86_64_code = x86_64_prologue ++ &[_]u8{
             // vaddsd xmm0, xmm0, xmm0
             0xc5, 0xfb, 0x58, 0xc0,
             // vaddsd xmm0, xmm0, xmm1
@@ -745,9 +773,7 @@ test "assemble adds" {
             0xc5, 0xf3, 0x58, 0xc0,
             // vaddsd xmm1, xmm0, xmm0
             0xc5, 0xfb, 0x58, 0xc8,
-            // ret
-            0xc3,
-        },
+        } ++ x86_64_epilogue,
         .expected_riscv64_code = riscv64_prologue ++ &[_]u8{
             // fadd.d fs0, fs0, fs0
             0x53, 0x74, 0x84, 0x02,
@@ -773,7 +799,7 @@ test "assemble other float arithmetic" {
             .{ .div_float = .{ .dst = .a, .src1 = .b, .src2 = .a } },
         },
         // zig fmt: off
-        .expected_x86_64_code = &.{
+        .expected_x86_64_code = x86_64_prologue ++ &[_]u8{
             // vsubsd xmm0, xmm0, xmm1
             0xc5, 0xfb, 0x5c, 0xc1,
             // vsubsd xmm0, xmm1, xmm0
@@ -786,9 +812,7 @@ test "assemble other float arithmetic" {
             0xc5, 0xfb, 0x5e, 0xc1,
             // vdivsd xmm0, xmm1, xmm0
             0xc5, 0xf3, 0x5e, 0xc0,
-            // ret
-            0xc3,
-        },
+        } ++ x86_64_epilogue,
         .expected_riscv64_code = riscv64_prologue ++ &[_]u8{
             // fsub.d fs0, fs0, fs1
             0x53, 0x74, 0x94, 0x0a,
@@ -810,10 +834,15 @@ test "assemble other float arithmetic" {
 test "assemble calls" {
     try runAssemblerTest(.{
         .instructions = &.{
+            // compressed load for risc-v
             .{ .call_unary = .{ .index = 5, .src = .a, .dst = .b } },
+            // uncompressed load + different regs
+            .{ .call_unary = .{ .index = 32, .src = .b, .dst = .a } },
+            // long sequence
+            .{ .call_unary = .{ .index = 256, .src = .a, .dst = .a } },
         },
         // zig fmt: off
-        .expected_x86_64_code = &.{0xc3},
+        .expected_x86_64_code = x86_64_prologue ++ x86_64_epilogue,
         .expected_riscv64_code = riscv64_prologue ++ &[_]u8{
             // fsgnj.d fa0, fs0, fs0
             0x53, 0x05, 0x84, 0x22,
@@ -823,6 +852,30 @@ test "assemble calls" {
             0x02, 0x95,
             // fsgnj.d fs1, fa0, fa0
             0xd3, 0x04, 0xa5, 0x22,
+
+            // fsgnj.d fa0, fs1, fs1
+            0x53, 0x85, 0x94, 0x22,
+            // ld a0, 256(s1)
+            0x03, 0xb5, 0x04, 0x10,
+            // c.jalr a0
+            0x02, 0x95,
+            // fsgnj.d fs0, fa0, fa0
+            0x53, 0x04, 0xa5, 0x22,
+
+            // fsgnj.d fa0, fs1, fs1
+            0x53, 0x05, 0x84, 0x22,
+            // lui a2, 0
+            0x37, 0x16, 0x00, 0x00,
+            // addi a2, a2, 0x800
+            0x13, 0x06, 0x06, 0x80,
+            // c.add a2, s1
+            0x26, 0x96,
+            // c.ld a0, 0(a2)
+            0x08, 0x62,
+            // c.jalr a0
+            0x02, 0x95,
+            // fsgnj.d fs0, fa0, fa0
+            0x53, 0x04, 0xa5, 0x22,
         } ++ riscv64_epilogue,
         // zig fmt: on
     });
