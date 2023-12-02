@@ -20,12 +20,12 @@ fn execLine(
     program: Program,
     line: []const u8,
     stdout: std.fs.File.Writer,
+    stack: []f64,
     constants: []const Compiler.Constant,
     diagnostic: ?*ExecDiagnostic,
 ) !void {
     var it = std.mem.tokenizeScalar(u8, line, ' ');
     var index: usize = 0;
-    var stack: [257]f64 = undefined;
     while (it.next()) |substring| {
         const arg = std.fmt.parseFloat(f64, substring) catch |e| {
             if (diagnostic) |d| d.* = .{ .invalid_numeric_literal = substring };
@@ -40,7 +40,7 @@ fn execLine(
         return error.WrongNumberOfArguments;
     }
 
-    code(&stack, constants.ptr);
+    code(stack.ptr, constants.ptr);
 
     if (program.num_returns == 0) {
         try stdout.writeAll("(empty stack)\n");
@@ -73,6 +73,8 @@ fn run(
     defer allocator.free(constants);
     try assembler.finalize();
     const func = assembler.getFunctionPointer();
+    const stack = try allocator.alloc(f64, program.peak_stack_size);
+    defer allocator.free(stack);
 
     var input = std.io.getStdIn().reader();
     var line_buf: [1024]u8 = undefined;
@@ -83,7 +85,7 @@ fn run(
         const line = std.mem.trimRight(u8, raw_line, "\r");
 
         var diagnostic = ExecDiagnostic{ .none = {} };
-        execLine(func, program, line, stdout, constants, &diagnostic) catch |e| {
+        execLine(func, program, line, stdout, stack, constants, &diagnostic) catch |e| {
             std.log.err("{s}", .{@errorName(e)});
             switch (e) {
                 error.WrongNumberOfArguments => std.log.info(
