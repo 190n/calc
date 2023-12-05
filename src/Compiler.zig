@@ -86,6 +86,16 @@ pub fn compileOperation(self: *Compiler, assembler: *Assembler, op: Program.Oper
             try assembler.assemble(.{ .call_unary = .{ .index = @intCast(index), .dst = .a, .src = .a } });
             try assembler.assemble(.{ .store = .{ .dst = .{ .base = .vm_stack, .offset = 8 * (self.stack_top - 1) }, .src = .a } });
         },
+
+        .dup => {
+            try assembler.assemble(.{ .load = .{ .dst = .a, .src = .{ .base = .vm_stack, .offset = 8 * (self.stack_top - 1) } } });
+            try assembler.assemble(.{ .store = .{ .dst = .{ .base = .vm_stack, .offset = 8 * self.stack_top }, .src = .a } });
+            self.stack_top += 1;
+        },
+
+        .pop => {
+            self.stack_top -= 1;
+        },
     }
 }
 
