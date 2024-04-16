@@ -145,7 +145,7 @@ pub fn main() !void {
         std.log.err("{s}", .{@errorName(e)});
         switch (e) {
             error.InvalidProgram => std.log.info("\"{s}\" is not a valid number or operator", .{erroneous_part}),
-            error.TooLong => std.log.info("program has too many instructions", .{}),
+            error.UnknownFunction => std.log.info("\"{s}\" is not a known function", .{erroneous_part}),
             error.WrongNumberOfArguments => try stderr.print(usage, .{argv[0]}),
             else => {},
         }

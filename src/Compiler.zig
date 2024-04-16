@@ -20,8 +20,8 @@ pub fn initWithConstants(allocator: std.mem.Allocator, program: Program) !Compil
         .stack_top = program.num_args,
     };
 
-    for (program.code.items) |inst| {
-        switch (inst) {
+    for (program.code.items) |token| {
+        switch (token) {
             .constant => |c| {
                 if (std.mem.indexOfScalar(f64, @ptrCast(compiler.constants.items), c) == null) {
                     try compiler.constants.append(.{ .float = c });
@@ -39,8 +39,8 @@ pub fn initWithConstants(allocator: std.mem.Allocator, program: Program) !Compil
     return compiler;
 }
 
-pub fn compileOperation(self: *Compiler, assembler: *Assembler, op: Program.Operation) !void {
-    switch (op) {
+pub fn compileOperation(self: *Compiler, assembler: *Assembler, token: Program.Token) !void {
+    switch (token) {
         .add => {
             try assembler.assemble(.{ .load = .{ .dst = .a, .src = .{ .base = .vm_stack, .offset = 8 * (self.stack_top - 2) } } });
             try assembler.assemble(.{ .load = .{ .dst = .b, .src = .{ .base = .vm_stack, .offset = 8 * (self.stack_top - 1) } } });
@@ -96,6 +96,8 @@ pub fn compileOperation(self: *Compiler, assembler: *Assembler, op: Program.Oper
         .pop => {
             self.stack_top -= 1;
         },
+
+        .get_variable, .set_variable => unreachable,
     }
 }
 

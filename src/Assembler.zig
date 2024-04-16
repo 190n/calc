@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const Operation = @import("./Program.zig").Operation;
+const Operation = @import("./Program.zig").Token;
 const Constant = @import("./Compiler.zig").Constant;
 
 const Assembler = @This();
@@ -32,6 +32,8 @@ pub const IntRegister = enum {
     /// register used for the second function argument (where a pointer to the VM constants is
     /// passed)
     constants,
+    /// third function arguemnt (variables)
+    variables,
 };
 
 pub const FloatRegister = enum {
@@ -86,6 +88,10 @@ pub const Instruction = union(enum) {
         dst: FloatRegister,
         src: FloatRegister,
     },
+    add_integer_immediate: struct {
+        target: IntRegister,
+        amount: i8,
+    },
 };
 
 pub fn init(target: std.Target, allocator: std.mem.Allocator) !Assembler {
@@ -132,27 +138,41 @@ fn riscvInstructionsToBytes(comptime instructions: []const RiscvInstruction) []c
 
 // zig fmt: off
 const x86_64_prologue = &[_]u8{
-    // 24 bytes for saving a FP register across function calls and for saving rbx and rbp
-    // for the caller
+    // 40 bytes. values pushed to stack, from top to bottom:
+    // - 8 bytes = save rbx
+    // - 8 bytes = save rbp
+    // - 8 bytes = save r12
+    // - 8 bytes = keep the stack 16 byte aligned (since the 8 byte return address was already
+    //             pushed, the size of our stack frame has to be 8 off a multiple of 16)
+    // - 8 bytes = space for saving an FP register across function calls
+
     // push rbx
     0x53,
     // push rbp
     0x55,
-    // use rax as an arbitrary register -- we don't actually care about the pushed value here
-    // push rax
-    0x50,
+    // push r12
+    0x41, 0x54,
+
+    // push rax twice to allocate the rest of our stack frame (we don't care about the values here)
+    0x50, 0x50,
+
     // now copy the arguments into saved registers
+    // vm_stack = rdi, constants = rsi, variables = rdx
     // mov rbx, rdi
     0x48, 0x89, 0xfb,
     // mov rbp, rsi
     0x48, 0x89, 0xf5,
+    // mov r12, rdx
+    0x49, 0x89, 0xd4,
 };
 // zig fmt: on
 
 const x86_64_epilogue = &[_]u8{
     // restore values from stack
-    // pop rax
-    0x58,
+    // pop rax twice to skip past the saved FP register and padding
+    0x58, 0x58,
+    // pop r12
+    0x41, 0x5c,
     // pop rbp
     0x5d,
     // pop rbx
@@ -230,7 +250,7 @@ pub fn emitEpilogue(self: *Assembler) !void {
 pub fn finalize(self: *Assembler) !void {
     // init and emit ensure that the length of the allocated slice is always aligned to pages
     const memory = self.code.writable.allocatedSlice();
-    try std.os.mprotect(memory, std.os.PROT.READ | std.os.PROT.EXEC);
+    try std.posix.mprotect(memory, std.posix.PROT.READ | std.posix.PROT.EXEC);
     self.code = .{ .executable = memory };
 }
 
@@ -244,7 +264,7 @@ pub fn deinit(self: *Assembler) void {
         .executable => |slice| {
             // we need to make the slice writable and non-executable since zig will try to @memset
             // it to 0xaa in debug builds
-            std.os.mprotect(@constCast(slice), std.os.PROT.READ | std.os.PROT.WRITE) catch return;
+            std.posix.mprotect(@constCast(slice), std.posix.PROT.READ | std.posix.PROT.WRITE) catch return;
             self.allocator.free(slice);
         },
     }
@@ -257,10 +277,12 @@ pub fn getRegisterNumber(self: Assembler, reg: anytype) u8 {
             .x86_64 => switch (reg) {
                 .vm_stack => 3, // rbx
                 .constants => 5, // rbp
+                .variables => 12, // r12
             },
             .riscv64 => switch (reg) {
                 .vm_stack => 8, // s0
                 .constants => 9, // s1
+                .variables => 18, // s2 TODO: not usable from some compressed instrs
             },
             else => unreachable,
         },
@@ -280,7 +302,7 @@ pub fn getRegisterNumber(self: Assembler, reg: anytype) u8 {
 }
 
 fn emitX86Offset(self: *Assembler, base: IntRegister, full_offset: i32, register_operand: FloatRegister) !void {
-    const base_num = self.getRegisterNumber(base);
+    const base_num = self.getRegisterNumber(base) & 0b111;
     const reg_num = self.getRegisterNumber(register_operand);
     if (full_offset == 0 and base_num != 5) {
         try self.emit(u8, (reg_num << 3) | base_num);
@@ -357,6 +379,9 @@ fn assembleLoad(self: *Assembler, dst: FloatRegister, src: BaseRegisterAndOffset
         .x86_64 => {
             // movsd dst, qword [base + offset]
             try self.emit(u8, 0xf2);
+            if (self.getRegisterNumber(src.base) >= 8) {
+                try self.emit(u8, 0x41);
+            }
             try self.emit(u8, 0x0f);
             try self.emit(u8, 0x10);
             try self.emitX86Offset(src.base, src.offset, dst);
@@ -406,6 +431,9 @@ fn assembleStore(self: *Assembler, dst: BaseRegisterAndOffset, src: FloatRegiste
         .x86_64 => {
             // movsd qword [base + offset], src
             try self.emit(u8, 0xf2);
+            if (self.getRegisterNumber(dst.base) >= 8) {
+                try self.emit(u8, 0x41);
+            }
             try self.emit(u8, 0x0f);
             try self.emit(u8, 0x11);
             try self.emitX86Offset(dst.base, dst.offset, src);
@@ -647,6 +675,7 @@ pub fn assemble(self: *Assembler, inst: Instruction) !void {
         .mul_float => |mul_float| try self.assembleMulFloat(mul_float.dst, mul_float.src1, mul_float.src2),
         .div_float => |div_float| try self.assembleDivFloat(div_float.dst, div_float.src1, div_float.src2),
         .call_unary => |call_unary| try self.assembleCallUnary(call_unary.index, call_unary.dst, call_unary.src),
+        .add_integer_immediate => unreachable,
     }
 }
 
